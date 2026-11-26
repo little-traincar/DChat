@@ -1135,7 +1135,7 @@ if (refusedText != null) {
                             }.orEmpty(),
                             rawTruncated = RAW_REPLAY && lastAssistantRaw.length > RAW_ASSISTANT_MAX,
                             rawChain = if (RAW_REPLAY && rawChainMessages.size > 1) {
-                                rawChainMessages.toString().takeIf { it.length <= RAW_CHAIN_MAX }.orEmpty()
+                                sanitizeChainForStore(rawChainMessages)
                             } else "",
                             status = ChatMsg.STATUS_FINISHED,
                             promptTokens = u?.promptTokens ?: it.promptTokens,
@@ -4336,8 +4336,74 @@ private const val HISTORY_IMAGE_MSGS = 6
 private const val RAW_REPLAY = true
 /** 单条 rawAssistant 上限（32KB），超限丢弃并标记 rawTruncated */
 private const val RAW_ASSISTANT_MAX = 32 * 1024
-/** rawChain 单条上限（64KB） */
-private const val RAW_CHAIN_MAX = 64 * 1024
+/**
+ * rawChain 单条上限。持久化前已把 tool_result 里的 image 块（base64）替换成占位文字，
+ * 正常工具链只有几 KB；这里留 256KB 余量，避免"工具返回长文本"时整条链被丢弃。
+ */
+private const val RAW_CHAIN_MAX = 256 * 1024
+/** 持久化工具链里，单个 tool_result 文本块的上限（超出截断），防止一条超长输出把链挤爆 */
+private const val RAW_CHAIN_TEXT_BLOCK_MAX = 8 * 1024
+
+/**
+ * 把本轮工具链清洗成可持久化的 JSON 字符串。
+ *
+ * 背景（用户反馈的 bug）：`rawChain` 是「模型上一轮调用了哪些工具、工具返回了什么」的唯一记忆来源。
+ * 以前直接把请求体里的 tool_result 原样存下来，而图像类工具（`local.download` / `local.imagegen`）
+ * 会在 tool_result 里带 base64 图片，一条链轻松超过 64KB 上限 → `takeIf` 整条丢弃 →
+ * 后续轮次模型完全看不到这轮的工具调用，于是出现"自己做过的事说没做过"。
+ *
+ * 这里做两件事：
+ * 1. 把 image 块替换成一行文字占位（图片本体在会话文件里，模型不需要 base64）；
+ * 2. 单个文本块截断到 [RAW_CHAIN_TEXT_BLOCK_MAX]。
+ * 清洗后链通常只有几 KB，能稳定落库，工具调用记录因此进入后续请求的历史。
+ */
+private fun sanitizeChainForStore(chain: List<JSONObject>): String {
+    val out = JSONArray()
+    for (msg in chain) {
+        val role = msg.optString("role")
+        if (role.isBlank()) continue
+        val cleaned = JSONObject().put("role", role)
+        when (val content = msg.opt("content")) {
+            is String -> cleaned.put("content", content.take(RAW_CHAIN_TEXT_BLOCK_MAX))
+            is JSONArray -> {
+                val blocks = JSONArray()
+                for (i in 0 until content.length()) {
+                    val block = content.optJSONObject(i) ?: continue
+                    blocks.put(sanitizeChainBlock(block))
+                }
+                cleaned.put("content", blocks)
+            }
+            else -> cleaned.put("content", "")
+        }
+        out.put(cleaned)
+    }
+    return out.toString().takeIf { it.length <= RAW_CHAIN_MAX }.orEmpty()
+}
+
+/** 单个 content 块：去掉 image（换成文字占位），tool_result 的内部 content 递归处理，文本块截断 */
+private fun sanitizeChainBlock(block: JSONObject): JSONObject {
+    val type = block.optString("type")
+    if (type == "image") {
+        return JSONObject().put("type", "text").put("text", "[图片已省略：原图保存在会话文件里]")
+    }
+    val copy = JSONObject(block.toString())
+    when (val inner = block.opt("content")) {
+        is JSONArray -> {
+            val arr = JSONArray()
+            for (i in 0 until inner.length()) {
+                val child = inner.optJSONObject(i) ?: continue
+                arr.put(sanitizeChainBlock(child))
+            }
+            copy.put("content", arr)
+        }
+        is String -> copy.put("content", inner.take(RAW_CHAIN_TEXT_BLOCK_MAX))
+        else -> Unit
+    }
+    if (type == "text") {
+        copy.put("text", block.optString("text").take(RAW_CHAIN_TEXT_BLOCK_MAX))
+    }
+    return copy
+}
 
 /**
  * 历史消息里最多重放多少个服务端解析文档（Files API file_id） * 官方限制：每个请求最多引20 个文档、文档文字合 MiB，超出返400 */
