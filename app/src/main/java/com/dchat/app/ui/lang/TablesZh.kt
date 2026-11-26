@@ -409,7 +409,10 @@ internal fun toolsZh(): ToolsStr = ToolsStr(
         "bg.cancel" to "取消后台任务",
         "schedule.create" to "新建定时任务",
         "schedule.list" to "定时任务列表",
-        "schedule.cancel" to "取消定时任务"
+        "schedule.cancel" to "取消定时任务",
+        "local.download" to "下载文件",
+        "local.imagegen" to "图像生成",
+        "local.tool_create" to "创建工具"
     ),
     descriptions = mapOf(
         "server.web_search" to "联网检索实时信息，返回网页标题、链接和摘要。",
@@ -437,7 +440,10 @@ internal fun toolsZh(): ToolsStr = ToolsStr(
         "bg.cancel" to "取消后台任务。",
         "schedule.create" to "创建周期定时任务（最小 15 分钟）。",
         "schedule.list" to "查看全部定时任务。",
-        "schedule.cancel" to "取消定时任务。"
+        "schedule.cancel" to "取消定时任务。",
+        "local.download" to "下载一个 HTTPS 文件到当前会话工作区。",
+        "local.imagegen" to "生成图片（豆包 Seedream / 千问 / 自定义通道）。",
+        "local.tool_create" to "创建新的用户工具并注册到 App（写 Python 代码与元信息）。"
     ),
     userNewTool = "新建工具",
     userEdit = "编辑",

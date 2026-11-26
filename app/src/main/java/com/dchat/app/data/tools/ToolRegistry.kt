@@ -71,6 +71,8 @@ object ToolRegistry {
     private const val ID_PYTHON = "local.python"
     private const val ID_DOWNLOAD = "local.download"
     private const val ID_IMAGEGEN = "local.imagegen"
+    /** 第五期：模型自建用户工具（写 entry.py + tool.json 并注册） */
+    private const val ID_TOOL_CREATE = "local.tool_create"
     // 4c：内置原生工具（文件 / 后台任务 / 定时任务）
     private const val ID_FS_LIST = "fs.list"
     private const val ID_FS_READ = "fs.read"
@@ -624,6 +626,23 @@ object ToolRegistry {
             // 首次调用要冷启动解释器 + import 运行器，5s 会出现假超时；给到 20s
             timeoutMs = 20_000,
             paramsSchema = """{"type":"object","properties":{"code":{"type":"string","description":"要执行的 Python 代码"},"purpose":{"type":"string"}},"required":["code"],"additionalProperties":false}"""
+        ),
+        // 第五期：让模型自己创建 / 注册用户工具（用户问"能不能做个工具注册进 App"时不再说做不到）
+        localTool(
+            ID_TOOL_CREATE, "tool_create",
+            "创建一个新的用户工具并注册到 App：写 Python 代码（入口 def run(args: dict) -> str）+ 元信息，"
+                + "落盘到工具目录并挂进工具列表，下一轮即可直接调用。同名工具已存在时覆盖更新（版本号自增）。"
+                + "需要工具带 UI 页面时，传 ui_mode=schema 并用 ui 给出 UI Schema v2，例如："
+                + "{\"version\":2,\"title\":\"天气\",\"data\":{\"city\":\"上海\",\"temp\":\"26°C\"},\"blocks\":[{\"type\":\"card\",\"children\":[{\"type\":\"keyvalue\",\"value\":{\"城市\":\"{{city}}\",\"气温\":\"{{temp}}\"}}]}]}；"
+                + "可用节点：column/row/card/group/scroll、text/markdown/image/badge/progress/keyvalue/spacer/divider、input/textarea/toggle/select/slider/date/button、list、bar/line/pie；"
+                + "字符串里的 {{key}} 会用 data[key] 替换。entry.py 可选实现 def load(args, state) 返回数据 dict、def action(name, args, data, state) 处理按钮动作。",
+            needs = emptySet(),
+            minMode = ToolMode.WORKSPACE_WRITE,
+            timeoutMs = 20_000,
+            // 默认开启：用户明确要求「模型应该能创建/注册工具」，不必先去设置里打开。
+            // 仍受会话权限约束（仅可查看的会话里调用会被拒绝）。
+            enabled = true,
+            paramsSchema = UserToolCreateTool.SCHEMA
         ),
         // ---- 4c：文件工具（fs.*） ----
         localTool(

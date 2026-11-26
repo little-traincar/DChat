@@ -409,7 +409,10 @@ internal fun toolsJa(): ToolsStr = ToolsStr(
         "bg.cancel" to "バックグラウンド取消",
         "schedule.create" to "定期タスク作成",
         "schedule.list" to "定期タスク一覧",
-        "schedule.cancel" to "定期タスク取消"
+        "schedule.cancel" to "定期タスク取消",
+        "local.download" to "ファイルをダウンロード",
+        "local.imagegen" to "画像生成",
+        "local.tool_create" to "ツールを作成"
     ),
     descriptions = mapOf(
         "server.web_search" to "リアルタイム情報をウェブ検索し、ページのタイトル・リンク・要約を返します。",
@@ -437,7 +440,10 @@ internal fun toolsJa(): ToolsStr = ToolsStr(
         "bg.cancel" to "バックグラウンドタスクをキャンセルします。",
         "schedule.create" to "定期タスクを作成します（最小 15 分）。",
         "schedule.list" to "すべての定期タスクを表示します。",
-        "schedule.cancel" to "定期タスクをキャンセルします。"
+        "schedule.cancel" to "定期タスクをキャンセルします。",
+        "local.download" to "HTTPS ファイルを現在の会話ワークスペースにダウンロードします。",
+        "local.imagegen" to "画像を生成します（Doubao Seedream / Qwen / カスタムチャネル）。",
+        "local.tool_create" to "新しいユーザーツールを作成し、アプリに登録します（Python コードとメタ情報）。"
     ),
     userNewTool = "ツールを新規作成",
     userEdit = "編集",

@@ -20,10 +20,13 @@ object LocalToolRunner {
     const val SCHEDULE_PREFIX = "schedule."
     const val DOWNLOAD = "local.download"
     const val IMAGEGEN = "local.imagegen"
+    /** 第五期：让模型自己创建 / 注册用户工具（写 entry.py + tool.json 并挂到注册表） */
+    const val TOOL_CREATE = "local.tool_create"
 
     fun handles(toolId: String): Boolean =
         toolId == DOWNLOAD ||
             toolId == IMAGEGEN ||
+            toolId == TOOL_CREATE ||
             toolId.startsWith(FS_PREFIX) ||
             toolId.startsWith(BG_PREFIX) ||
             toolId.startsWith(SCHEDULE_PREFIX)
@@ -63,6 +66,8 @@ object LocalToolRunner {
                     conversationMode = normalized,
                     isCancelled = isCancelled
                 )
+
+                TOOL_CREATE -> UserToolCreateTool.run(context, argsJson)
 
                 else -> FileTools.execute(context, toolId, argsJson, conversationId, normalized)
                     ?: BgTasks.execute(context, toolId, argsJson, conversationId)

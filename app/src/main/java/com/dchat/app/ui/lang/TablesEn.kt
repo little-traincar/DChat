@@ -409,7 +409,10 @@ internal fun toolsEn(): ToolsStr = ToolsStr(
         "bg.cancel" to "Cancel background task",
         "schedule.create" to "New schedule",
         "schedule.list" to "Schedules",
-        "schedule.cancel" to "Cancel schedule"
+        "schedule.cancel" to "Cancel schedule",
+        "local.download" to "Download file",
+        "local.imagegen" to "Image generation",
+        "local.tool_create" to "Create tool"
     ),
     descriptions = mapOf(
         "server.web_search" to "Search the web for real-time info and return page titles, links and snippets.",
@@ -437,7 +440,10 @@ internal fun toolsEn(): ToolsStr = ToolsStr(
         "bg.cancel" to "Cancel a background task.",
         "schedule.create" to "Create a recurring scheduled task (minimum 15 minutes).",
         "schedule.list" to "Show all scheduled tasks.",
-        "schedule.cancel" to "Cancel a scheduled task."
+        "schedule.cancel" to "Cancel a scheduled task.",
+        "local.download" to "Download an HTTPS file into the current conversation workspace.",
+        "local.imagegen" to "Generate images (Doubao Seedream / Qwen / custom channel).",
+        "local.tool_create" to "Create a new user tool and register it into the app (Python code + metadata)."
     ),
     userNewTool = "New tool",
     userEdit = "Edit",

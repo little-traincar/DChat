@@ -409,7 +409,10 @@ internal fun toolsKo(): ToolsStr = ToolsStr(
         "bg.cancel" to "백그라운드 취소",
         "schedule.create" to "예약 작업 만들기",
         "schedule.list" to "예약 작업 목록",
-        "schedule.cancel" to "예약 작업 취소"
+        "schedule.cancel" to "예약 작업 취소",
+        "local.download" to "파일 다운로드",
+        "local.imagegen" to "이미지 생성",
+        "local.tool_create" to "도구 만들기"
     ),
     descriptions = mapOf(
         "server.web_search" to "실시간 정보를 웹에서 검색해 페이지 제목, 링크, 요약을 반환합니다.",
@@ -437,7 +440,10 @@ internal fun toolsKo(): ToolsStr = ToolsStr(
         "bg.cancel" to "백그라운드 작업을 취소합니다.",
         "schedule.create" to "주기 예약 작업을 만듭니다(최소 15분).",
         "schedule.list" to "모든 예약 작업을 표시합니다.",
-        "schedule.cancel" to "예약 작업을 취소합니다."
+        "schedule.cancel" to "예약 작업을 취소합니다.",
+        "local.download" to "HTTPS 파일을 현재 대화 작업 공간으로 다운로드합니다.",
+        "local.imagegen" to "이미지를 생성합니다(Doubao Seedream / Qwen / 사용자 지정 채널).",
+        "local.tool_create" to "새 사용자 도구를 만들어 앱에 등록합니다(Python 코드와 메타데이터)."
     ),
     userNewTool = "새 도구",
     userEdit = "편집",
