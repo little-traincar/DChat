@@ -79,7 +79,8 @@ object LocalToolRunner {
 
 /**
  * App 启动时把原生工具的持久化状态接上：
- * - [BgTasks]：恢复任务列表，重启前 RUNNING 的标记中断，QUEUED 的继续跑；
+ * - [BgTasks]：恢复任务列表；重启前 RUNNING / QUEUED 的都标为中断失败（不自动续跑，
+ *   避免 App 启动/收广播时去起前台服务导致 5 秒看门狗超时）；
  * - [ScheduleStore]：加载定时任务并重新挂 AlarmManager（进程重启后闹钟虽然还在，重挂一次更稳）。
  *
  * 由 [ToolRegistry.init] 在 AppState 初始化时调用一次（幂等），避免改 MainActivity。

@@ -24,6 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import com.dchat.app.data.AppState
+import com.dchat.app.data.tools.BgTasks
 import com.dchat.app.ui.chat.ChatScreen
 import com.dchat.app.ui.files.SessionFilesScreen
 import com.dchat.app.ui.lang.Lang
@@ -38,6 +39,18 @@ import com.dchat.app.ui.usage.UsageScreen
 enum class Screen { Chat, Settings, Background, Browser, Usage, ToolUi, BgTasks, Schedule, Files }
 
 class MainActivity : ComponentActivity() {
+
+    // 前台/后台可见性：可见时后台任务只在进程内跑，不起前台服务
+    // （避免主线程繁忙时 startForegroundService 5 秒看门狗超时，见 BgTasks.setAppVisible）
+    override fun onStart() {
+        super.onStart()
+        BgTasks.setAppVisible(this, true)
+    }
+
+    override fun onStop() {
+        BgTasks.setAppVisible(this, false)
+        super.onStop()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()

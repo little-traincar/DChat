@@ -11,7 +11,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -40,8 +42,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *   [ACTION_NOTIFY] / [ACTION_PYTHON]（python 还要求 local.python 开关打开）；
  * - 并发上限 [MAX_CONCURRENT] = 5：超出进入 QUEUED 队列（不拒绝），有空位自动补位；
  * - 任务状态持久化到 `filesDir/bg_tasks.json`，App 重启后仍可 `bg.list`；
- *   重启前处于 RUNNING 的任务标为 FAILED（TASK_INTERRUPTED），QUEUED 的会继续执行；
- * - 有运行中任务时启动前台服务 + 常驻通知；任务完成发通知（Android 13+ 若未授权通知则静默跳过）。
+ *   重启前处于 RUNNING / QUEUED 的任务一律标 FAILED（TASK_INTERRUPTED），**不自动续跑**；
+ * - App 在前台时任务只在进程内跑协程（不起 FGS）；切后台才补前台服务 + 常驻通知；
+ *   任务完成发通知（Android 13+ 若未授权通知则静默跳过）。
  */
 object BgTasks {
 
@@ -100,6 +103,39 @@ object BgTasks {
     @Volatile
     private var initialized = false
 
+    /**
+     * App 是否可见（由 MainActivity onStart/onStop 维护）。
+     *
+     * 可见时后台任务**只在进程内跑协程，不起前台服务**：前台进程不会被回收，
+     * 没必要冒 `startForegroundService` 5 秒看门狗超时的风险（主线程忙时 onCreate 排队
+     * 超过 5s 会直接 RemoteServiceException，已在 2026-11-26 17:28 复现 3 次）。
+     * 切后台时若仍有运行中的任务，再补起 FGS。
+     */
+    @Volatile
+    private var appVisible = false
+
+    fun isAppVisible(): Boolean = appVisible
+
+    /** MainActivity 生命周期回调：可见时撤 FGS（进程内执行），切后台时为运行中任务补 FGS。 */
+    fun setAppVisible(context: Context, visible: Boolean) {
+        appVisible = visible
+        if (!visible) {
+            // 先确保初始化拿得到 appContext；init 不再自动 dispatch，不会在这里起新任务
+            init(context)
+            val running = counts().first
+            if (running > 0) {
+                val ctx = appContext ?: context.applicationContext ?: context
+                BgNotifications.ensurePostPermission(ctx)
+                BgTaskService.start(ctx)
+                BgTaskService.update(ctx, running, counts().second)
+            }
+        } else {
+            // 回前台：进程内继续跑，撤掉常驻通知（避免不必要的前台服务）
+            val ctx = appContext ?: context.applicationContext ?: context
+            if (counts().first > 0) BgTaskService.stop(ctx)
+        }
+    }
+
     // ---------------------------------------------------------------- 初始化 / 持久化
 
     fun init(context: Context) {
@@ -110,10 +146,12 @@ object BgTasks {
             val f = File(app.filesDir, FILE_NAME)
             file = f
             loadLocked(f)
-            // 重启前没跑完的标记为中断；排队中的保留，后面继续补位
+            // 进程重启后：RUNNING（无存活 Job）与 QUEUED 都不会自动续跑，统一标为中断失败。
+            // 这样 App 启动/收到广播时不会因为「恢复排队任务」去调 startForegroundService，
+            // 避免主线程繁忙时的 5 秒看门狗超时（RemoteServiceException）。
             var changed = false
             tasks.forEach { (id, rec) ->
-                if (rec.status == STATUS_RUNNING) {
+                if (rec.status == STATUS_RUNNING || rec.status == STATUS_QUEUED) {
                     tasks[id] = rec.copy(
                         status = STATUS_FAILED,
                         finishedAt = System.currentTimeMillis(),
@@ -124,10 +162,8 @@ object BgTasks {
             }
             if (changed) persistLocked()
             queue.clear()
-            tasks.values.filter { it.status == STATUS_QUEUED }.forEach { queue.addLast(it.id) }
             initialized = true
         }
-        dispatch()
     }
 
     fun isAllowedAction(action: String): Boolean = action in ALLOWED_ACTIONS
@@ -227,11 +263,16 @@ object BgTasks {
         val (running, queued) = counts()
         if (running > 0) {
             BgNotifications.ensurePostPermission(ctx)
-            BgTaskService.start(ctx)
+            if (appVisible) {
+                // 可见时不起 FGS：进程内协程足够，避免 startForegroundService 5 秒看门狗超时
+                BgTaskService.stop(ctx)
+            } else {
+                BgTaskService.start(ctx)
+            }
+            BgTaskService.update(ctx, running, queued)
         } else {
             BgTaskService.stop(ctx)
         }
-        if (running > 0) BgTaskService.update(ctx, running, queued)
     }
 
     private fun updateForegroundText() {
@@ -673,6 +714,11 @@ class BgTaskService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 系统可能重复 start；每次幂等确认前台状态。
+        // 任务已经跑完（running == 0）时不要留下空服务，否则常驻通知/看门狗都是负担。
+        if (BgTasks.serviceCounts().first <= 0) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (promoteToForeground()) {
             runCatching { updateNotification() }
                 .onFailure { Log.w(TAG, "前台服务通知更新失败", it) }
@@ -735,10 +781,26 @@ class BgTaskService : Service() {
         private var fgsUnavailable = false
 
         fun start(context: Context) {
-            if (fgsUnavailable) return
+            if (fgsUnavailable || BgTasks.isAppVisible()) return
             val inst = instance
             if (inst != null && inst.foregroundStarted) return
             val app = context.applicationContext ?: context
+            // 关键：必须等主线程空下来再发 startForegroundService。
+            // 主线程忙（Compose 重建/JSON 解析/Python）时 onCreate 会排队，超过系统 5 秒
+            // 看门狗就会被 RemoteServiceException 杀掉。这里统一 post 到主线程队列尾部，
+            // 让「发 FGS」和「onCreate 升前台」紧挨着执行。
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                startOnMain(app)
+            } else {
+                Handler(Looper.getMainLooper()).post { startOnMain(app) }
+            }
+        }
+
+        private fun startOnMain(app: Context) {
+            if (fgsUnavailable || BgTasks.isAppVisible()) return
+            if (BgTasks.serviceCounts().first <= 0) return // 已跑完，别起空服务
+            val inst = instance
+            if (inst != null && inst.foregroundStarted) return
             runCatching {
                 ContextCompat.startForegroundService(app, Intent(app, BgTaskService::class.java))
             }.onFailure {
