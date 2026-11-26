@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 系统相机拍照的临时原图（拍完压缩后删除） -->
+    <cache-path name="camera" path="camera/" />
+    <!-- 聊天图片（只用于本 App 内部读取，不对外暴露） -->
+    <files-path name="chat_images" path="chat_images/" />
+    <files-path name="workspaces" path="workspaces/" />
+    <!-- 会话工作区文件：供「当前会话的文件」页用系统打开/分享 -->
+    <files-path name="workspaces" path="workspaces/" />
+</paths>

@@ -1,0 +1,118 @@
+package com.dchat.app.ui.tools
+
+import com.dchat.app.data.tools.PyResult
+import org.json.JSONObject
+import org.json.JSONTokener
+
+/**
+ * UI Schema v2 宿主 ↔ `entry.py` 的调用协议。
+ *
+ * 现状：`dchat_runner.execute()`（另一条工作线维护，本任务不改）仍按 v1 约定
+ * `func(args)` 调用入口函数，而 v2 约定是
+ * `load(args, state)` / `action(name, args, data, state)`。
+ *
+ * 为了不动 Python 运行器，宿主在**用户代码末尾追加一小段适配器**，把
+ * `func(payload)` 桥接到 v2 的多参数签名；适配器只用内置函数，不 import 任何模块，
+ * 沙箱语义（import 白名单 / open 限制）不受影响。
+ */
+object UiV2Protocol {
+
+    const val ENTRY_LOAD = "__dchat_v2_load"
+    const val ENTRY_ACTION = "__dchat_v2_action"
+
+    /** 追加到用户代码末尾的适配器 */
+    val ADAPTER: String = """
+def __dchat_v2_arg_count(fn, fallback):
+    try:
+        return fn.__code__.co_argcount
+    except Exception:
+        return fallback
+
+def __dchat_v2_load(payload):
+    fn = globals().get("load")
+    if not callable(fn):
+        return {}
+    args = payload.get("args") or {}
+    state = payload.get("state") or {}
+    if __dchat_v2_arg_count(fn, 2) >= 2:
+        return fn(args, state)
+    return fn(args)
+
+def __dchat_v2_action(payload):
+    fn = globals().get("action")
+    if not callable(fn):
+        return {"ok": True}
+    name = payload.get("action") or ""
+    args = payload.get("args") or {}
+    data = payload.get("data") or {}
+    state = payload.get("state") or {}
+    n = __dchat_v2_arg_count(fn, 4)
+    if n >= 4:
+        return fn(name, args, data, state)
+    if n == 3:
+        return fn(name, args, data)
+    if n == 2:
+        return fn(name, args)
+    return fn()
+""".trimIndent()
+
+    private val LOAD_DEF = Regex("(?m)^\\s*def\\s+load\\s*\\(")
+    private val ACTION_DEF = Regex("(?m)^\\s*def\\s+action\\s*\\(")
+
+    /** 是否声明了 v2 的 `load()`（决定打开页面后是否后台刷新、动作后是否 refresh） */
+    fun hasLoad(code: String): Boolean = LOAD_DEF.containsMatchIn(code)
+
+    fun hasAction(code: String): Boolean = ACTION_DEF.containsMatchIn(code)
+
+    /** 拼上适配器；重复调用不会重复追加 */
+    fun adaptedCode(code: String): String =
+        if (code.contains("def __dchat_v2_load")) code else code + "\n\n" + ADAPTER + "\n"
+
+    fun openPayload(state: JSONObject): JSONObject = JSONObject()
+        .put("event", "open")
+        .put("state", state)
+
+    fun loadPayload(state: JSONObject): JSONObject = JSONObject()
+        .put("event", "load")
+        .put("state", state)
+
+    fun actionPayload(name: String, args: JSONObject, data: JSONObject, state: JSONObject): JSONObject =
+        JSONObject()
+            .put("event", "action")
+            .put("action", name)
+            .put("args", args)
+            .put("data", data)
+            .put("state", state)
+
+    /** 解析 Python 返回的 JSON 对象（dict）；不是对象时返回 null */
+    fun parseObject(output: String): JSONObject? =
+        runCatching { JSONObject(output) }.getOrNull()
+
+    /** 解析任意 JSON（旧 UI 树可能是对象/数组/字符串） */
+    fun parseAny(output: String): Any? =
+        runCatching { JSONTokener(output).nextValue() }.getOrNull()
+
+    /**
+     * 返回 dict 里的错误文案：`error` / `_error`。
+     * 按 D79 决定：这两个键只作为错误提示，不进入数据源。
+     */
+    fun errorOf(result: JSONObject?): String {
+        if (result == null) return ""
+        return result.optString("error").ifBlank { result.optString("_error") }.trim()
+    }
+
+    /** 去掉 `_state` / `error` / `_error`，剩下的键才是 `{{key}}` 数据源 */
+    fun stripMeta(result: JSONObject): JSONObject {
+        val out = JSONObject()
+        result.keys().forEach { key ->
+            if (key == "_state" || key == "error" || key == "_error") return@forEach
+            out.put(key, result.opt(key))
+        }
+        return out
+    }
+
+    /** 把 Python 侧 `_state` 写回 page.json 时用：只取对象，其他类型忽略 */
+    fun stateOf(result: JSONObject?): JSONObject? = result?.optJSONObject("_state")
+
+    fun isPyUnavailable(result: PyResult): Boolean = result.errorCode == "PY_UNAVAILABLE"
+}

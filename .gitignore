@@ -1,0 +1,66 @@
+# build outputs
+build/
+app/build/
+.gradle/
+.kotlin/
+local.properties
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+
+# snapshots & worker logs
+docs/backups/
+build-*.log
+
+# Python 独立子进程：spike / 测试夹具的可再生产物（不要入库）
+# 可执行启动器本体是 app/src/main/jniLibs/arm64-v8a/libpychild.so，用
+# app/src/main/cpp/build-launcher.sh 重新生成；以下都是临时解包产物。
+testtools/
+libpython3.11.so
+assets-app.imy
+app.imy
+childtest/
+childtest.tar
+pyhome/
+ui/child-*
+
+# Python 字节码（Chaquopy 会就地生成，不要入库）
+__pycache__/
+*.pyc
+
+# 每工具进程验收用的临时脚本/夹具（可再生成）
+proc_test_tools/
+proc_install.sh
+proc_uninstall.sh
+proc_tools.tar
+recovery_conversations.json
+tools-device.json
+tools2.json
+
+# 调试截图/临时产物
+ui/probe*.png
+ui/bug*.png
+ui/menu*.png
+
+# 设备验收截图（体积大，不随工程上传）
+ui/
+# 打包产物
+dist/
+# 数据恢复临时目录 / 探针工具
+_restore_tmp/
+proc_test_tools/
+testtools/
+python-spike/
+# Python 字节码
+__pycache__/
+*.pyc
+# 签名与本地配置
+*.jks
+*.keystore
+keystore.properties
+local.properties
+# 日志
+*.log

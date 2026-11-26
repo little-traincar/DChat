@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  全局仍禁明文（与架构文档「HTTPS only」一致）。
+  仅给自定义生图通道的「本机回环」端点开例外：本地部署（Ollama / vLLM / SD-WebUI）
+  常见 http://127.0.0.1:xxxx / http://localhost:xxxx；局域网 IP 端点请用 https。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>
