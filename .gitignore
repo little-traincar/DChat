@@ -15,10 +15,9 @@ local.properties
 docs/backups/
 build-*.log
 
-# Python 独立子进程：spike / 测试夹具的可再生产物（不要入库）
-# 可执行启动器本体是 app/src/main/jniLibs/arm64-v8a/libpychild.so，用
-# app/src/main/cpp/build-launcher.sh 重新生成；以下都是临时解包产物。
-testtools/
+# Python 鐙珛瀛愯繘绋嬶細spike / 娴嬭瘯澶瑰叿鐨勫彲鍐嶇敓浜х墿锛堜笉瑕佸叆搴擄級
+# 鍙墽琛屽惎鍔ㄥ櫒鏈綋鏄?app/src/main/jniLibs/arm64-v8a/libpychild.so锛岀敤
+# app/src/main/cpp/build-launcher.sh 閲嶆柊鐢熸垚锛涗互涓嬮兘鏄复鏃惰В鍖呬骇鐗┿€?testtools/
 libpython3.11.so
 assets-app.imy
 app.imy
@@ -27,12 +26,11 @@ childtest.tar
 pyhome/
 ui/child-*
 
-# Python 字节码（Chaquopy 会就地生成，不要入库）
-__pycache__/
+# Python 瀛楄妭鐮侊紙Chaquopy 浼氬氨鍦扮敓鎴愶紝涓嶈鍏ュ簱锛?__pycache__/
 *.pyc
 
-# 每工具进程验收用的临时脚本/夹具（可再生成）
-proc_test_tools/
+# 姣忓伐鍏疯繘绋嬮獙鏀剁敤鐨勪复鏃惰剼鏈?澶瑰叿锛堝彲鍐嶇敓鎴愶級
+/proc_test_tools/
 proc_install.sh
 proc_uninstall.sh
 proc_tools.tar
@@ -40,27 +38,25 @@ recovery_conversations.json
 tools-device.json
 tools2.json
 
-# 调试截图/临时产物
+# 璋冭瘯鎴浘/涓存椂浜х墿
 ui/probe*.png
 ui/bug*.png
 ui/menu*.png
 
-# 设备验收截图（体积大，不随工程上传）
-ui/
-# 打包产物
-dist/
-# 数据恢复临时目录 / 探针工具
-_restore_tmp/
-proc_test_tools/
+# 璁惧楠屾敹鎴浘锛堜綋绉ぇ锛屼笉闅忓伐绋嬩笂浼狅級
+/ui/
+# 鎵撳寘浜х墿
+/dist/
+# 鏁版嵁鎭㈠涓存椂鐩綍 / 鎺㈤拡宸ュ叿
+/_restore_tmp/
+/proc_test_tools/
 testtools/
 python-spike/
-# Python 字节码
-__pycache__/
+# Python 瀛楄妭鐮?__pycache__/
 *.pyc
-# 签名与本地配置
-*.jks
+# 绛惧悕涓庢湰鍦伴厤缃?*.jks
 *.keystore
 keystore.properties
 local.properties
-# 日志
+# 鏃ュ織
 *.log
