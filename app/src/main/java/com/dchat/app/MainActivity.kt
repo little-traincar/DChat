@@ -124,15 +124,23 @@ class MainActivity : ComponentActivity() {
                     targetState = current,
                     transitionSpec = {
                         val pushing = targetState.ordinal > initialState.ordinal
-                        if (pushing) {
-                            // 新页面从左侧滑入
-                            (slideInHorizontally(tween(300)) { -it } + fadeIn(tween(300)))
-                                .togetherWith(fadeOut(tween(180)))
-                        } else {
-                            // 返回：从右往左缩回去
-                            fadeIn(tween(180)).togetherWith(
-                                slideOutHorizontally(tween(300)) { -it } + fadeOut(tween(300))
-                            )
+                        when {
+                            // 工具页要“秒开”：不做滑入动画，避免额外 300ms 的等待感
+                            targetState == Screen.ToolUi || initialState == Screen.ToolUi ->
+                                fadeIn(tween(80)).togetherWith(fadeOut(tween(80)))
+
+                            pushing -> {
+                                // 新页面从左侧滑入
+                                (slideInHorizontally(tween(300)) { -it } + fadeIn(tween(300)))
+                                    .togetherWith(fadeOut(tween(180)))
+                            }
+
+                            else -> {
+                                // 返回：从右往左缩回去
+                                fadeIn(tween(180)).togetherWith(
+                                    slideOutHorizontally(tween(300)) { -it } + fadeOut(tween(300))
+                                )
+                            }
                         }
                     },
                     label = "screen"

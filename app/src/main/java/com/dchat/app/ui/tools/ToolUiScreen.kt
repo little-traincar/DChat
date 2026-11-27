@@ -35,6 +35,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -124,6 +125,8 @@ fun ToolUiScreen(
 
     var pageInfo by remember(toolId) { mutableStateOf<ToolPageInfo?>(null) }
     var loadError by remember(toolId) { mutableStateOf<String?>(null) }
+    // 首屏遮罩：WebView 创建 + 页面脚本（可能同步等 Python）期间先给用户一个即时反馈
+    var pageReady by remember(toolId) { mutableStateOf(false) }
     /** 渲染进程崩溃后 WebView 已不可用：换成占位错误页（重试时才重建 WebView） */
     var webGone by remember(toolId) { mutableStateOf(false) }
     var reloadKey by remember(toolId) { mutableIntStateOf(0) }
@@ -248,9 +251,25 @@ fun ToolUiScreen(
                                         onPageLoaded = {
                                             mainHandler.post {
                                                 if (!alive[0]) return@post
+                                                pageReady = true
                                                 if (timing[1] < 0) {
                                                     timing[1] = SystemClock.elapsedRealtime() - openStart
                                                     logTiming()
+                                                    // 页面不调 Python 时 firstRun 永远为 -1：加载后 2.5s 兜底落盘一次
+                                                    mainHandler.postDelayed({
+                                                        if (alive[0] && timing[3] == 0L) {
+                                                            timing[3] = 1L
+                                                            runCatching {
+                                                                java.io.File(
+                                                                    appContext.filesDir,
+                                                                    "web_perf.log"
+                                                                ).appendText(
+                                                                    "${System.currentTimeMillis()} tool=$toolId " +
+                                                                        "create=${timing[0]} load=${timing[1]} firstRun=${timing[2]}\n"
+                                                                )
+                                                            }
+                                                        }
+                                                    }, 2500L)
                                                 }
                                             }
                                         }
@@ -277,6 +296,7 @@ fun ToolUiScreen(
                             onRetry = {
                                 loadError = null
                                 webGone = false
+                                pageReady = false
                                 reloadKey++
                             },
                             onClose = onBack
@@ -300,6 +320,25 @@ fun ToolUiScreen(
             else -> ToolStatusPage("工具不存在或已被删除：$toolId")
         }
 
+        // 首屏遮罩：WebView 创建 + 页面脚本执行（可能同步等 Python）期间先显示加载态
+        if (info?.mode == ToolPageMode.WEB && !pageReady && loadError == null) {
+            Box(
+                Modifier.fillMaxSize().background(c.bg),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(
+                        strokeWidth = 2.5.dp,
+                        color = c.text2,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text(L.tools.uiWorking, fontSize = 13.sp, color = c.text2)
+                    Spacer(Modifier.height(6.dp))
+                    Text("首次打开稍慢，之后会更快", fontSize = 11.sp, color = c.text3)
+                }
+            }
+        }
         // 右上角浮动 ×（同现有工具页样式：40dp 圆形 + 半透明底 + 白 ×）
         Box(
             Modifier

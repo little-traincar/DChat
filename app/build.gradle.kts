@@ -14,8 +14,8 @@ android {
         applicationId = "com.dchat.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.0.7"
+        versionCode = 10
+        versionName = "1.0.8"
         // Chaquopy 的 Python 解释器是 native 组件：只打 arm64（用户要求的设备范围）
         ndk {
             abiFilters += listOf("arm64-v8a")
