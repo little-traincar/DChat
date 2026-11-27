@@ -72,6 +72,7 @@ import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.KeyboardDoubleArrowDown
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.ContentCopy
@@ -990,6 +991,15 @@ LaunchedEffect(listState, app.currentId) {
     LaunchedEffect(listState, app.currentId) {
         snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
             .collect { pos -> app.currentId?.let { scrollMemory[it] = pos } }
+    }
+
+    // 「回到底部」按钮是否显示：离开底部且不再跟随（跟随中列表自然贴底，不要闪）
+    var showJumpToBottom by remember { mutableStateOf(false) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.canScrollForward to follow }
+            .collect { (canForward, following) ->
+                showJumpToBottom = scrollRestored && canForward && !following
+            }
     }
 
     // 键盘升降：视口高度一变就贴底。layoutInfo 在布局完成后才更新    // 所以这里的 clamp 基准是新视口，不会滚完还差一截
@@ -2265,9 +2275,10 @@ IconBtn(Icons.Rounded.Shield, {
                     modifier = Modifier.weight(1f)
                 )
             } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.weight(1f),
+                Box(Modifier.weight(1f)) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(
                         start = 16.dp,
                         end = 16.dp,
@@ -2347,6 +2358,37 @@ onOpenImage = { imgs, index ->
                             onStopGenerating = if (m.status == ChatMsg.STATUS_WIP) ({ stop() }) else null,
                         )
                     }
+                }
+                // 1.0.3：「回到底部」悬浮按钮——上翻离开底部后出现，点一下平滑滚到最新消息
+                if (showJumpToBottom && messages.isNotEmpty()) {
+                    Box(
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = 16.dp, bottom = 14.dp)
+                            .size(40.dp)
+                            .shadow(6.dp, CircleShape)
+                            .clip(CircleShape)
+                            .background(c.bg)
+                            .border(1.dp, c.line2, CircleShape)
+                            .clickable {
+                                follow = true
+                                val last = messages.lastIndex
+                                if (last >= 0) {
+                                    // 必须用 Compose 的 scope：animateScrollToItem 需要 MonotonicFrameClock，
+                                    // 用 ChatRuntime.scope（普通 Main 调度器）会抛 IllegalStateException 闪退。
+                                    scope.launch { listState.animateScrollToItem(last) }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.KeyboardDoubleArrowDown,
+                            null,
+                            tint = c.text2,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
                 }
             }
 
