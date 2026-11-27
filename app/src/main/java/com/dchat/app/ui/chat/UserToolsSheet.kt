@@ -76,7 +76,10 @@ fun UserToolsSheet(
     val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.7f).dp
     var tools by remember { mutableStateOf<List<UserToolRowData>?>(null) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(visible) {
+        if (!visible) return@LaunchedEffect
+        // 每次打开都重新读盘：设置里删掉/新增的工具要立刻反映出来（旧实现用 Unit，列表会一直是第一次的缓存）
+        tools = null
         tools = withContext(Dispatchers.IO) { loadUserTools(ctx) }
     }
 
