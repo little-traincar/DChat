@@ -288,7 +288,22 @@ data class ChatStr(
     val stoppedEmpty: String,
     /** {0}=文件数，{1}=大小 */
     val deleteChatFilesHint: String,
-    val downloadSaveToPhone: String
+    val downloadSaveToPhone: String,
+    // ---- 1.0.3（D97 / D99）----
+    /** 回答因 max_tokens 被截断时的气泡提示 */
+    val answerTruncated: String,
+    /** 文档配额（每请求 ≤20）超限提示：%d = 上限 */
+    val docLimitNotice: String,
+    /** 停止生成时补回给模型的占位 tool_result 文案 */
+    val toolStoppedResult: String,
+    /** 下载卡「大小未知」（服务端没给 Content-Length / 落盘文件读不到长度） */
+    val sizeUnknown: String,
+    /** Python 输出落盘提示：%s = 相对路径，%s = 大小 */
+    val pythonOutputSaved: String,
+    /** Python 工具卡「完整输出：文件名（大小）」：%s = 文件名，%s = 大小 */
+    val pythonFullOutput: String,
+    /** 文本预览截断提示：%s = 只显示的大小 */
+    val previewTruncated: String
 )
 
 /** 设置页 */

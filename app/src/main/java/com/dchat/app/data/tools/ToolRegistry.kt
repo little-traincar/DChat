@@ -70,6 +70,9 @@ object ToolRegistry {
     private const val ID_GALLERY = "local.gallery"
     private const val ID_PYTHON = "local.python"
     private const val ID_DOWNLOAD = "local.download"
+    private const val ID_LOCAL_WEB_SEARCH = "local.web_search"
+    private const val ID_LOCAL_WEB_FETCH = "local.web_fetch"
+    private const val ID_LOCAL_TOOL_LIST = "local.tool_list"
     private const val ID_IMAGEGEN = "local.imagegen"
     /** 第五期：模型自建用户工具（写 entry.py + tool.json 并注册） */
     private const val ID_TOOL_CREATE = "local.tool_create"
@@ -293,8 +296,9 @@ object ToolRegistry {
         val toolsEpochHash = StablePrefix.sha256(StablePrefix.canonicalJson(toolsForHash))
         return ToolRequestConfig(
             thinking = usable(ID_THINKING) != null,
-            webSearch = usable(ID_WEB_SEARCH) != null,
-            readUrl = usable(ID_READ_URL) != null,
+            // 1.0.3：搜索/阅读改为客户端 local.web_search/local.web_fetch，不再声明服务端内置工具
+            webSearch = false,
+            readUrl = false,
             safetyLevel = if (safetyLevel == SAFETY_HIGH || safetyLevel == SAFETY_LOW) {
                 safetyLevel
             } else {
@@ -546,16 +550,6 @@ object ToolRegistry {
 
     private fun seedTools(): List<ToolSpec> = listOf(
         serverTool(
-            ID_WEB_SEARCH, "联网搜索",
-            "联网检索实时信息，返回与查询相关的网页标题、链接和摘要。",
-            enabled = true
-        ),
-        serverTool(
-            ID_READ_URL, "阅读链接",
-            "打开用户给出的网页并抽取正文，返回网页主要内容的纯文本。",
-            enabled = true
-        ),
-        serverTool(
             ID_THINKING, "深度思考",
             "让模型先进行更深入的推理再作答，返回带推理过程的最终回答（会消耗更多 tokens）。",
             enabled = false
@@ -645,6 +639,32 @@ object ToolRegistry {
             paramsSchema = UserToolCreateTool.SCHEMA
         ),
         // ---- 4c：文件工具（fs.*） ----
+        localTool(
+            ID_LOCAL_WEB_SEARCH, "web_search",
+            "联网检索实时信息；参数 query/count/need_content，返回标题、链接、摘要。",
+            needs = NET,
+            minMode = ToolMode.READ_ONLY,
+            timeoutMs = 60_000,
+            enabled = true,
+            paramsSchema = """{"type":"object","properties":{"query":{"type":"string"},"count":{"type":"integer"},"need_content":{"type":"boolean"}},"required":["query"],"additionalProperties":false}"""
+        ),
+        localTool(
+            ID_LOCAL_WEB_FETCH, "web_fetch",
+            "读取一个 http/https 网页并返回标题与 Markdown 正文。",
+            needs = NET,
+            minMode = ToolMode.READ_ONLY,
+            timeoutMs = 60_000,
+            enabled = true,
+            paramsSchema = """{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false}"""
+        ),
+        localTool(
+            ID_LOCAL_TOOL_LIST, "tool_list",
+            "列出当前会话实际可下发给模型的工具及未下发原因，供模型自查。",
+            needs = emptySet(),
+            minMode = ToolMode.READ_ONLY,
+            timeoutMs = 10_000,
+            enabled = true
+        ),
         localTool(
             ID_DOWNLOAD, "download",
             "下载一个 HTTPS 文件到当前会话工作区，返回文件信息。",
@@ -832,11 +852,25 @@ object ToolRegistry {
 
         val out = ArrayList<ToolSpec>(persisted.size + 16)
         var added = false
+        // 1.0.3：旧 server.web_search / server.read_url 静默淘汰，状态迁到新的 local 工具
+        val legacySearch = remaining.remove(ID_WEB_SEARCH)?.enabled
+            ?: legacyBool(prefs, PREF_TOOL_SEARCH, true)
+        val legacyRead = remaining.remove(ID_READ_URL)?.enabled
+            ?: legacyBool(prefs, PREF_TOOL_READ_URL, true)
+        val hadLocalSearch = remaining.containsKey(ID_LOCAL_WEB_SEARCH)
+        val hadLocalFetch = remaining.containsKey(ID_LOCAL_WEB_FETCH)
         seedTools().forEach { seed ->
             val old = remaining.remove(seed.id)
             if (old == null) {
                 added = true
-                out.add(if (migrate) migrateSeedLocked(seed, prefs) else seed)
+                var migrated = if (migrate) migrateSeedLocked(seed, prefs) else seed
+                if (!hadLocalSearch && seed.id == ID_LOCAL_WEB_SEARCH) {
+                    migrated = migrated.copy(enabled = legacySearch)
+                }
+                if (!hadLocalFetch && seed.id == ID_LOCAL_WEB_FETCH) {
+                    migrated = migrated.copy(enabled = legacyRead)
+                }
+                out.add(migrated)
             } else {
                 out.add(mergeBuiltInLocked(seed, old))
             }

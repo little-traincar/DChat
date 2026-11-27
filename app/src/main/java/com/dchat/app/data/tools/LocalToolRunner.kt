@@ -20,12 +20,18 @@ object LocalToolRunner {
     const val SCHEDULE_PREFIX = "schedule."
     const val DOWNLOAD = "local.download"
     const val IMAGEGEN = "local.imagegen"
+    const val WEB_SEARCH = "local.web_search"
+    const val WEB_FETCH = "local.web_fetch"
+    const val TOOL_LIST = "local.tool_list"
     /** 第五期：让模型自己创建 / 注册用户工具（写 entry.py + tool.json 并挂到注册表） */
     const val TOOL_CREATE = "local.tool_create"
 
     fun handles(toolId: String): Boolean =
         toolId == DOWNLOAD ||
             toolId == IMAGEGEN ||
+            toolId == WEB_SEARCH ||
+            toolId == WEB_FETCH ||
+            toolId == TOOL_LIST ||
             toolId == TOOL_CREATE ||
             toolId.startsWith(FS_PREFIX) ||
             toolId.startsWith(BG_PREFIX) ||
@@ -59,6 +65,9 @@ object LocalToolRunner {
         return withContext(Dispatchers.IO) {
             when (toolId) {
                 DOWNLOAD -> DownloadTool.run(context, argsJson, conversationId ?: "preview")
+                WEB_SEARCH, WEB_FETCH ->
+                    WebTools.run(context, toolId, argsJson, conversationId ?: "preview")
+                TOOL_LIST -> toolListResult(normalized)
                 IMAGEGEN -> ImageGenTool.run(
                     context = context,
                     argsJson = argsJson,
@@ -79,6 +88,21 @@ object LocalToolRunner {
                     )
             }
         }
+    }
+
+    /** 模型自查：本会话实际可下发 / 未下发的工具及原因。 */
+    private fun toolListResult(mode: String): PyResult {
+        val sb = StringBuilder()
+        sb.append("当前会话可下发工具（权限档位：$mode）：\n")
+        ToolRegistry.tools.filter { !it.hidden }.forEach { t ->
+            val reason = when {
+                !t.enabled -> "未启用"
+                !ToolRegistry.canExecute(t.id, mode) -> "权限档位不足"
+                else -> "可下发"
+            }
+            sb.append("${t.name} — ${t.description} [${reason}]\n")
+        }
+        return PyResult(true, sb.toString().trim())
     }
 }
 

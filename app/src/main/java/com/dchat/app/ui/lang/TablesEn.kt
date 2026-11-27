@@ -173,7 +173,14 @@ internal fun chatEn(): ChatStr = ChatStr(
     stopped = "Stopped",
     stoppedEmpty = "Stopped (no content generated)",
     deleteChatFilesHint = "This conversation has %d file(s), %s total; deleting it will delete these files too.",
-    downloadSaveToPhone = "Save to phone"
+    downloadSaveToPhone = "Save to phone",
+    answerTruncated = "The answer reached the output limit and was truncated",
+    docLimitNotice = "This request referenced more documents than the official limit (%d max); the extra ones were truncated",
+    toolStoppedResult = "Generation stopped by the user; the tool was not executed",
+    sizeUnknown = "Unknown size",
+    pythonOutputSaved = "The full output was saved to %s (%s). Use fs.read to read the first lines if needed.",
+    pythonFullOutput = "Full output: %s (%s)",
+    previewTruncated = "(only the first %s is shown; the full content is in the session files)"
 )
 
 internal fun settingsEn(): SettingsStr = SettingsStr(
@@ -386,6 +393,9 @@ internal fun toolsEn(): ToolsStr = ToolsStr(
     names = mapOf(
         "server.web_search" to "Web search",
         "server.read_url" to "Read links",
+        "local.web_search" to "Web search",
+        "local.web_fetch" to "Read URL",
+        "local.tool_list" to "Tool list",
         "server.thinking" to "Deep thinking",
         "server.document_parse" to "File parsing",
         "server.ocr" to "Image OCR",

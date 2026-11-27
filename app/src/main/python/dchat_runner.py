@@ -3,12 +3,15 @@
 由 Kotlin 侧 PyRuntime 调用：
     dchat_runner.execute(entry_path, entry_func, args_json, sandbox, site_packages, state_path)
 
-安全边界（4a）：
-- import 白名单 + 已安装包；其它模块直接抛 ImportError("该模块未内置，请先安装")；
-- open() 只允许 sandbox 目录内（realpath 防符号链接逃逸）；
-- 工作目录切到 sandbox；
-- 不把真实 builtins.__import__ 暴露给用户代码（只给每个用户模块一份安全的 builtins）。
-注意：这不是强沙箱（Python 解释器同进程、线程无法强杀），只是 4a 的受限执行约定。
+安全边界（1.0.3 起）：
+- **标准库 / 内置 C 加速器 / 已安装第三方包全部放行**：不再维护 import 白名单，
+  `os/sys/io/zlib/gzip/struct/functools/typing/enum/dataclasses/threading/asyncio/subprocess/...`
+  都可用；网络模块（socket/ssl/http/urllib/requests…）也不做权限拦截，网络可用性由系统决定；
+- **只保留一条限制**：open() 只允许工具沙箱目录内（realpath 防符号链接逃逸）；
+- 不做 os.chdir（bg.run 会在 5 个线程里并发跑，进程级 cwd 会被抢）；相对路径由 sandbox_open 拼接；
+- 本地收集输出上限 1MB，超出截断；回给模型的 64KB 截断由 Kotlin 侧负责；
+- 不把真实 builtins.__import__ 暴露给用户代码已不再需要（白名单取消），但 open 仍用包装版。
+注意：这不是强沙箱（Python 解释器同进程、线程无法强杀），只是受限执行约定。
 """
 
 import builtins
@@ -19,89 +22,43 @@ import os
 import sys
 import threading
 
-# 用户代码允许 import 的标准库（brief 指定）
-_ALLOWED_STD = {
-    "json", "math", "random", "re", "datetime", "time", "statistics",
-    "itertools", "collections", "uuid", "hashlib", "base64",
-}
-
-# C 加速器 / 标准库私有实现模块：用户代码不直接写它们，但上面那些模块内部会 import
-# （例如 datetime -> _datetime、hashlib -> _sha256/_hashlib、json -> _json），
-# 不放行会在 import 链中间报 ImportError，表现为「datetime 不能 import」的假象。
-_ALLOWED_ACCEL = {
-    "_collections_abc", "_bisect", "_heapq", "_struct", "_functools", "_operator",
-    "_abc", "_string", "_contextvars", "_weakref", "_codecs", "_locale",
-    "_sha1", "_sha256", "_sha512", "_md5", "_blake2", "_hashlib",
-    "_json", "_datetime", "_random", "_decimal", "_csv", "_statistics",
-    "_socket", "_ssl",
-}
-
-# 这些加速器等价于联网模块，仍按会话权限卡
-_ACCEL_NET = {"_socket", "_ssl"}
-
-# 常见第三方包（构建期未内置；安装到 site-packages 后可 import）
-_ALLOWED_THIRD = {"requests", "yaml", "bs4", "dateutil"}
-
-# 永远禁止（即使 site-packages 里出现同名目录）
-# 注：socket/ssl/http/urllib 不在此列——网络口径 B：read 档禁止联网，workspace/full 放行。
-_DENIED = {
-    "os", "sys", "subprocess", "ctypes", "importlib", "shutil",
-    "pathlib", "builtins", "multiprocessing", "threading", "signal", "gc",
-    "inspect", "code", "codeop", "runpy", "pdb", "doctest", "site",
-    "sysconfig", "platform", "resource", "pty", "fcntl", "posix", "tempfile",
-    "pickle", "shelve", "sqlite3",
-}
-
-# 网络相关模块：只有会话权限 ≥ workspace 才允许 import（B 方案）
-_NET_MODULES = {"socket", "ssl", "http", "urllib", "urllib3", "requests", "idna", "certifi", "charset_normalizer"}
-
-_IMPORT_ERR = "该模块未内置或不允许"
-_NET_DENIED_ERR = "当前会话权限不足，不能联网"
+# 本地收集上限：1MB（Kotlin 侧再把超 64KB 的结果落 python_out.txt，回模型前由调用方截断）
+_OUTPUT_LIMIT = 1024 * 1024
 _SANDBOX_ERR = "只能读写工具沙箱目录内的文件"
 
 # 进程级共享状态的锁（sys.path 修改、首次导入等）
 _PREP_LOCK = threading.Lock()
 
 
-def _top_level_installed(site_packages):
-    """site-packages 里的顶层模块/包名（requests 的依赖也可被 import）"""
-    names = set()
-    try:
-        for entry in os.listdir(site_packages):
-            path = os.path.join(site_packages, entry)
-            if entry.endswith((".py", ".pyc", ".so", ".pyd")):
-                names.add(entry.split(".", 1)[0])
-            elif os.path.isdir(path) and os.path.isfile(os.path.join(path, "__init__.py")):
-                names.add(entry)
-    except OSError:
-        pass
-    return names
+class _CappedBuffer(io.StringIO):
+    """最多收集 limit 个字符的 stdout；超出部分丢弃并打 truncated 标记。"""
+
+    def __init__(self, limit):
+        super().__init__()
+        self._limit = limit
+        self.truncated = False
+
+    def write(self, s):
+        if not isinstance(s, str):
+            s = str(s)
+        remaining = self._limit - self.tell()
+        if remaining <= 0:
+            if s:
+                self.truncated = True
+            return len(s)
+        if len(s) > remaining:
+            self.truncated = True
+            s = s[:remaining]
+        return super().write(s)
 
 
-def _make_import(allowed, perm):
-    real_import = builtins.__import__
-    can_net = perm in ("workspace", "full")
-
-    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        top = name.split(".", 1)[0]
-        if top in _DENIED:
-            raise ImportError(_IMPORT_ERR)
-        if top.startswith("_"):
-            # C 加速器：标准库内部的 import 一律放行；用户手写 import _xxx 也只放行白名单里的
-            if top in _ACCEL_NET:
-                if not can_net:
-                    raise ImportError(_NET_DENIED_ERR)
-                return real_import(name, globals, locals, fromlist, level)
-            if top in _ALLOWED_ACCEL or top.lstrip("_") in _ALLOWED_STD:
-                return real_import(name, globals, locals, fromlist, level)
-            raise ImportError(_IMPORT_ERR)
-        if top in _NET_MODULES and not can_net:
-            raise ImportError(_NET_DENIED_ERR)
-        if level == 0 and top not in allowed and top not in _NET_MODULES:
-            raise ImportError(_IMPORT_ERR)
-        return real_import(name, globals, locals, fromlist, level)
-
-    return guarded_import
+def _cap_result(text):
+    """结果字符串统一截到 1MB（保头，尾部标注）。"""
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= _OUTPUT_LIMIT:
+        return text
+    return text[:_OUTPUT_LIMIT] + "\n...(输出超过 1MB，已截断)"
 
 
 def _make_open(sandbox):
@@ -124,15 +81,13 @@ def _make_open(sandbox):
     return sandbox_open
 
 
-def _prepare(sandbox, site_packages, perm):
-    """公共准备：返回 (sandbox, allowed, safe_builtins, base_globals)。
+def _prepare(sandbox, site_packages, perm="workspace"):
+    """公共准备：返回 (sandbox, safe_builtins, base_globals)。
 
     并发注意（bg.run 会在 5 个线程里同时跑 Python）：
     - **不做 os.chdir**：进程级工作目录会被别的线程抢走；相对路径由 sandbox_open 负责拼接；
     - sys.path 的插入用锁保护并去重（只影响模块解析，不改 cwd）。
     """
-    if perm not in ("read", "workspace", "full"):
-        perm = "workspace"
     sandbox = os.path.realpath(sandbox)
     site_packages = os.path.realpath(site_packages)
     os.makedirs(sandbox, exist_ok=True)
@@ -140,17 +95,14 @@ def _prepare(sandbox, site_packages, perm):
     with _PREP_LOCK:
         if site_packages not in sys.path:
             sys.path.insert(0, site_packages)
-    installed = _top_level_installed(site_packages)
-    allowed = _ALLOWED_STD | _ALLOWED_THIRD | installed
     safe_builtins = dict(builtins.__dict__)
-    safe_builtins["__import__"] = _make_import(allowed, perm)
     safe_builtins["open"] = _make_open(sandbox)
     base = {
         "__name__": "__dchat_user_tool__",
         "__builtins__": safe_builtins,
         "__perm__": perm,
     }
-    return sandbox, allowed, safe_builtins, base
+    return sandbox, safe_builtins, base
 
 
 def _builtins_with_buffer(safe_builtins, buf):
@@ -185,7 +137,7 @@ def execute_code(code, args_json="{}", sandbox="", site_packages="", state_path=
     """local.python 裸代码模式：执行代码，返回 stdout + 最后一个表达式值。"""
     _mods_before = set(sys.modules) if os.environ.get("DCHAT_CHILD") == "1" else None
     try:
-        sandbox, allowed, safe_builtins, base = _prepare(sandbox, site_packages, perm)
+        sandbox, safe_builtins, base = _prepare(sandbox, site_packages, perm)
         try:
             args = json.loads(args_json) if args_json and args_json.strip() else {}
         except Exception:
@@ -201,7 +153,7 @@ def execute_code(code, args_json="{}", sandbox="", site_packages="", state_path=
         last_expr = None
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             last_expr = ast.Expression(tree.body.pop().value)
-        buf = io.StringIO()
+        buf = _CappedBuffer(_OUTPUT_LIMIT)
         globals_dict["__builtins__"] = _builtins_with_buffer(safe_builtins, buf)
         if tree.body:
             exec(compile(tree, "<python>", "exec"), globals_dict)
@@ -212,14 +164,22 @@ def execute_code(code, args_json="{}", sandbox="", site_packages="", state_path=
         printed = buf.getvalue().rstrip()
         if printed:
             parts.append(printed)
+        if getattr(buf, "truncated", False):
+            parts.append("...(stdout 超过 1MB，已截断)")
         if value is not None:
             parts.append(str(value))
-        result = "\n".join(parts).strip() or "(无输出)"
+        result = _cap_result("\n".join(parts).strip() or "(无输出)")
         return json.dumps({"ok": True, "result": result}, ensure_ascii=False)
+    except RecursionError:
+        return json.dumps(
+            {"ok": False, "error": "递归过深（RecursionError）：请减少递归层级或改用迭代", "code": "TOOL_ERROR"},
+            ensure_ascii=False,
+        )
     except ImportError as e:
-        msg = str(e) or _IMPORT_ERR
-        code = "PERMISSION_DENIED" if _NET_DENIED_ERR in msg else "IMPORT_DENIED"
-        return json.dumps({"ok": False, "error": msg, "code": code}, ensure_ascii=False)
+        return json.dumps(
+            {"ok": False, "error": "ImportError: %s" % (str(e) or "模块不可用"), "code": "TOOL_ERROR"},
+            ensure_ascii=False,
+        )
     except PermissionError as e:
         return json.dumps({"ok": False, "error": str(e) or _SANDBOX_ERR, "code": "SANDBOX_DENIED"}, ensure_ascii=False)
     except Exception as e:
@@ -229,10 +189,8 @@ def execute_code(code, args_json="{}", sandbox="", site_packages="", state_path=
 
 
 def execute(entry_path, entry_func="run", args_json="{}", sandbox="", site_packages="", state_path="", perm="workspace"):
-    """执行用户工具，返回 JSON 字符串（ok/result/error/code）。perm: read/workspace/full"""
+    """执行用户工具，返回 JSON 字符串（ok/result/error/code）。perm: read/workspace/full（仅记录，不再拦截）"""
     _mods_before = set(sys.modules) if os.environ.get("DCHAT_CHILD") == "1" else None
-    if perm not in ("read", "workspace", "full"):
-        perm = "workspace"
     sandbox = os.path.realpath(sandbox)
     site_packages = os.path.realpath(site_packages)
     os.makedirs(sandbox, exist_ok=True)
@@ -241,8 +199,6 @@ def execute(entry_path, entry_func="run", args_json="{}", sandbox="", site_packa
         with _PREP_LOCK:
             if site_packages not in sys.path:
                 sys.path.insert(0, site_packages)
-        installed = _top_level_installed(site_packages)
-        allowed = _ALLOWED_STD | _ALLOWED_THIRD | installed
         try:
             args = json.loads(args_json) if args_json.strip() else {}
         except Exception as e:
@@ -254,7 +210,6 @@ def execute(entry_path, entry_func="run", args_json="{}", sandbox="", site_packa
             code = f.read()
 
         safe_builtins = dict(builtins.__dict__)
-        safe_builtins["__import__"] = _make_import(allowed, perm)
         safe_builtins["open"] = _make_open(sandbox)
         globals_dict = {
             "__name__": "__dchat_user_tool__",
@@ -276,11 +231,17 @@ def execute(entry_path, entry_func="run", args_json="{}", sandbox="", site_packa
                 result = json.dumps(result, ensure_ascii=False, default=str)
             except Exception:
                 result = str(result)
-        return json.dumps({"ok": True, "result": result}, ensure_ascii=False)
+        return json.dumps({"ok": True, "result": _cap_result(result)}, ensure_ascii=False)
+    except RecursionError:
+        return json.dumps(
+            {"ok": False, "error": "递归过深（RecursionError）：请减少递归层级或改用迭代", "code": "TOOL_ERROR"},
+            ensure_ascii=False,
+        )
     except ImportError as e:
-        msg = str(e) or _IMPORT_ERR
-        code = "PERMISSION_DENIED" if _NET_DENIED_ERR in msg else "IMPORT_DENIED"
-        return json.dumps({"ok": False, "error": msg, "code": code}, ensure_ascii=False)
+        return json.dumps(
+            {"ok": False, "error": "ImportError: %s" % (str(e) or "模块不可用"), "code": "TOOL_ERROR"},
+            ensure_ascii=False,
+        )
     except PermissionError as e:
         return json.dumps({"ok": False, "error": str(e) or _SANDBOX_ERR, "code": "SANDBOX_DENIED"}, ensure_ascii=False)
     except Exception as e:

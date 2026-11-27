@@ -173,7 +173,14 @@ internal fun chatZh(): ChatStr = ChatStr(
     stopped = "已停止",
     stoppedEmpty = "已停止（未生成内容）",
     deleteChatFilesHint = "该会话有 %d 个文件，共 %s；删除会话会同时删除这些文件。",
-    downloadSaveToPhone = "保存到手机"
+    downloadSaveToPhone = "保存到手机",
+    answerTruncated = "回答达到输出上限，已截断",
+    docLimitNotice = "本次请求引用的文档超过官方上限（最多 %d 个），已自动截断",
+    toolStoppedResult = "用户已停止，工具未执行",
+    sizeUnknown = "大小未知",
+    pythonOutputSaved = "完整输出已保存到 %s（共 %s），需要时可先用 fs.read 读取前若干行",
+    pythonFullOutput = "完整输出：%s（%s）",
+    previewTruncated = "（仅显示前 %s，完整内容在会话文件里）"
 )
 
 internal fun settingsZh(): SettingsStr = SettingsStr(
@@ -386,6 +393,9 @@ internal fun toolsZh(): ToolsStr = ToolsStr(
     names = mapOf(
         "server.web_search" to "联网搜索",
         "server.read_url" to "阅读链接",
+        "local.web_search" to "联网搜索",
+        "local.web_fetch" to "阅读链接",
+        "local.tool_list" to "工具清单",
         "server.thinking" to "深度思考",
         "server.document_parse" to "文件解析",
         "server.ocr" to "图片文字识别",

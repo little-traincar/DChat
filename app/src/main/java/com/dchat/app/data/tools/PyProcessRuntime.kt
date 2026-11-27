@@ -49,6 +49,12 @@ object PyProcessRuntime {
     private const val FAILURE_COOLDOWN_MS = 60_000L
     private const val CHILD_BOOT_TIMEOUT_MS = 20_000L
 
+    /** 单次执行内存软限：256MB（子进程 RSS 增量） */
+    private const val CHILD_SOFT_MEMORY_KB = 256L * 1024
+    /** 解释器总硬限：512MB（子进程 RSS 绝对值）；超限直接 kill 子进程，下次请求自动重启解释器 */
+    private const val CHILD_HARD_MEMORY_KB = 512L * 1024
+    private const val MEMORY_POLL_MS = 250L
+
     private val requestIds = AtomicLong(1)
     private val semaphore = Semaphore(POOL_SIZE)
     private val lock = Any()
@@ -119,6 +125,9 @@ object PyProcessRuntime {
     private class StartException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
     private class ChildTimeout(message: String) : Exception(message)
+
+    /** 子进程内存超限：已 close（kill），下一次请求会重新启动解释器 */
+    private class ChildMemoryLimit(message: String) : Exception(message)
 
     suspend fun runPythonCode(
         context: Context,
@@ -319,12 +328,18 @@ object PyProcessRuntime {
                 idle.addLast(worker)
             }
             worker = null
-            return PyResult(
-                ok = resp.optBoolean("ok", false),
-                output = resp.optString("result"),
-                errorCode = resp.optString("code").takeIf { it.isNotBlank() },
-                errorMessage = resp.optString("error").takeIf { it.isNotBlank() }
+            return PyRuntime.finalizeOutput(
+                context, conversationId,
+                PyResult(
+                    ok = resp.optBoolean("ok", false),
+                    output = resp.optString("result"),
+                    errorCode = resp.optString("code").takeIf { it.isNotBlank() },
+                    errorMessage = resp.optString("error").takeIf { it.isNotBlank() }
+                )
             )
+        } catch (e: ChildMemoryLimit) {
+            Log.w(TAG, "child memory limit exceeded, killed", e)
+            return PyResult(false, errorCode = "MEMORY_LIMIT", errorMessage = e.message)
         } catch (e: ChildTimeout) {
             Log.w(TAG, "child timeout, kill -9", e)
             return PyResult(false, errorCode = "TOOL_TIMEOUT", errorMessage = e.message)
@@ -590,10 +605,23 @@ object PyProcessRuntime {
             stdin.newLine()
             stdin.flush()
             val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            val baselineKb = rssKb
             while (System.nanoTime() < deadline) {
-                val remain = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(1)
-                val line = queue.poll(remain, TimeUnit.MILLISECONDS)
-                    ?: break
+                val remainMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(1)
+                val line = queue.poll(minOf(remainMs, MEMORY_POLL_MS), TimeUnit.MILLISECONDS)
+                // 内存看门狗：轮询期间采样子进程 RSS
+                val rss = rssKb
+                if (rss > 0) {
+                    if (rss > CHILD_HARD_MEMORY_KB) {
+                        close()
+                        throw ChildMemoryLimit("Python 解释器内存超过 512MB，已终止子进程并将在下次请求重启")
+                    }
+                    if (baselineKb > 0 && rss - baselineKb > CHILD_SOFT_MEMORY_KB) {
+                        close()
+                        throw ChildMemoryLimit("单次执行内存超过 256MB，已终止子进程并将在下次请求重启")
+                    }
+                }
+                if (line == null) continue
                 if (line == EOF) break
                 val o = runCatching { JSONObject(line) }.getOrDefault(JSONObject())
                 if (o.optString("id").isBlank()) {

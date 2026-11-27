@@ -78,6 +78,11 @@ sealed class ApiEvent {
          * 官方说明它**已包含在 output_tokens 里**，这里单独记录只用于展示/核对，不要二次相加。
          */
         val safetyTokens: Int = 0,
+        /**
+         * `usage.output_tokens_details.thinking_tokens`：思考 token 数。
+         * 同样已包含在 output_tokens 里，只透传展示，不做二次求和。
+         */
+        val thinkingTokens: Int = 0,
         /** usage 事件来源：message_start / message_delta */
         val source: String = "",
         /** 服务端原始 usage JSON（P3-B 诊断） */
@@ -195,8 +200,31 @@ class DeepSeekApi(
 ) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        // 官方：没有新内容时流式响应会发 `: keep-alive` 注释，正常流不会静默 120s；
+        // 这里用 120s 覆盖「服务端迟迟不回响应头/握手卡住」，与 SSE 空闲看门狗形成双保险。
+        // 原来 0 = 永不超时，握手阶段可能无限等。
+        .readTimeout(120, TimeUnit.SECONDS)
         .build()
+
+    /**
+     * 各模型单次输出上限（`max_tokens`，含思考 token）。
+     * 官方 Messages API：`deepseek-flash` 当前上限 32768；新模型在这里追加，
+     * 未匹配的模型回退 [DEFAULT_MAX_TOKENS]（旧默认 8192，保持兼容）。
+     */
+    private val MODEL_MAX_TOKENS = mapOf(
+        "deepseek-flash" to 32_768
+    )
+    private val DEFAULT_MAX_TOKENS = 8_192
+
+    private fun maxOutputTokens(model: String): Int =
+        MODEL_MAX_TOKENS[model.trim().lowercase()] ?: DEFAULT_MAX_TOKENS
+
+    private companion object {
+        /** 流式空闲看门狗：连续 120s 没有任何 SSE 行就主动取消并报错（官方建议可重试） */
+        private const val STREAM_IDLE_TIMEOUT_MS = 120_000L
+        private const val STREAM_IDLE_TIMEOUT = "连接无响应，可重试（120 秒未收到任何数据）"
+        private const val STREAM_EOF_INCOMPLETE = "连接中断，响应不完整，请重试"
+    }
 
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
@@ -321,10 +349,15 @@ class DeepSeekApi(
 
         val body = JSONObject().apply {
             put("model", model)
-            put("max_tokens", 8192)
+            // 按模型取上限；带 thinking 时 max_tokens 含思考 token（官方语义）
+            put("max_tokens", maxOutputTokens(model))
             put("stream", true)
             if (effectiveSystem.isNotBlank()) put("system", effectiveSystem)
-            if (requestTools.thinking) put("thinking", JSONObject().put("type", "enabled"))
+            // 官方文档：thinking 字段**不传 = 默认开启**，所以关闭时必须显式发 disabled。
+            put(
+                "thinking",
+                JSONObject().put("type", if (requestTools.thinking) "enabled" else "disabled")
+            )
             if (tools.length() > 0) put("tools", tools)
             // 官方「模型内容安全」：level 只能是 high / low；关闭时请求体完全不出现该字段
             if (requestTools.safetyLevel == "high" || requestTools.safetyLevel == "low") {
@@ -440,7 +473,7 @@ class DeepSeekApi(
                             return
                         }
                         try {
-                            parseSse(source, maxRounds, emit)
+                            parseSse(source, maxRounds, call, emit)
                         } catch (e: Exception) {
                             emit(ApiEvent.Failed(e.message ?: Lang.current.misc.parseFailed))
                         }
@@ -974,7 +1007,12 @@ class DeepSeekApi(
 
     // ---------- SSE ----------
 
-    private fun parseSse(source: okio.BufferedSource, maxRounds: Int, onEvent: (ApiEvent) -> Unit) {
+    private fun parseSse(
+        source: okio.BufferedSource,
+        maxRounds: Int,
+        call: okhttp3.Call,
+        onEvent: (ApiEvent) -> Unit
+    ) {
         var event = ""
         val data = StringBuilder()
         var toolCalls = 0
@@ -990,6 +1028,44 @@ class DeepSeekApi(
         val toolUseInitial = HashMap<Int, String>()
         // 缓存阶段 A：按 index 保存服务端原始内容块（thinking 含 signature），结束时原样组装
         val rawBlocks = java.util.TreeMap<Int, JSONObject>()
+        // message_delta 的 stop_reason / 拒答说明；message_stop 兜底补 Done 时要用
+        var lastStopReason: String? = null
+        var lastExplanation: String? = null
+        var rawEmitted = false
+        var doneEmitted = false
+        // 终止事件只允许发一次：watchdog / error 事件 / EOF 兜底可能并发到达
+        val terminal = java.util.concurrent.atomic.AtomicBoolean(false)
+        val lastActivity = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+
+        fun safeEmit(ev: ApiEvent) {
+            when (ev) {
+                is ApiEvent.Done -> {
+                    if (!terminal.compareAndSet(false, true)) return
+                    doneEmitted = true
+                    onEvent(ev)
+                }
+                is ApiEvent.Failed, is ApiEvent.InputBlocked -> {
+                    if (!terminal.compareAndSet(false, true)) return
+                    onEvent(ev)
+                }
+                else -> {
+                    if (terminal.get()) return
+                    onEvent(ev)
+                }
+            }
+        }
+
+        /** message_stop 兜底：若之前没发过 Done，用缓存的 stop_reason/tool 计数补发一次。 */
+        fun emitDoneIfNeeded() {
+            if (doneEmitted) return
+            if (rawBlocks.isNotEmpty() && !rawEmitted) {
+                rawEmitted = true
+                val raw = JSONArray()
+                rawBlocks.values.forEach { raw.put(it) }
+                safeEmit(ApiEvent.AssistantRaw(raw.toString()))
+            }
+            safeEmit(ApiEvent.Done(lastStopReason, toolCalls, lastExplanation))
+        }
 
         fun dispatch() {
             // 每个事件的 data 缓冲区必须在分发后清空：分支里带 `?: return` 的
@@ -999,6 +1075,21 @@ class DeepSeekApi(
             try {
                 if (data.isNotEmpty()) {
                     val payload = data.toString()
+                    // 官方错误流：以 `error` 事件结束，之后没有 message_delta/message_stop；
+                    // 某些超时还会发一条没有事件名、data 是 {"type":"error",...} 的事件。
+                    // 因此不看 event 名，任何 data JSON 的 type=="error" 都立即失败（保留已输出内容）。
+                    val root = runCatching { JSONObject(payload) }.getOrNull()
+                    if (root != null) {
+                        val payloadType = root.optString("type")
+                        if (payloadType == "error" || event == "error") {
+                            safeEmit(ApiEvent.Failed(sseErrorMessage(root)))
+                            return
+                        }
+                        if (payloadType == "message_stop" || event == "message_stop") {
+                            emitDoneIfNeeded()
+                            return
+                        }
+                    }
                     when (event) {
                     "message_start" -> {
                         // Anthropic 协议：message_start.message 里带模型名与首次 usage（只有输入侧）
@@ -1009,13 +1100,14 @@ class DeepSeekApi(
                             message.optJSONObject("usage")?.let { u ->
                                 startPromptTokens = totalPromptTokens(u)
                                 startCacheReadTokens = u.optInt("cache_read_input_tokens", 0)
-                                onEvent(
+                                safeEmit(
                                     ApiEvent.Usage(
                                         promptTokens = startPromptTokens,
                                         cacheReadTokens = startCacheReadTokens,
                                         completionTokens = u.optInt("output_tokens", 0),
                                         model = modelName,
                                         safetyTokens = safetyTokensOf(u),
+                                        thinkingTokens = thinkingTokensOf(u),
                                         source = "message_start",
                                         rawUsage = u.toString()
                                     )
@@ -1031,14 +1123,14 @@ class DeepSeekApi(
                         when (val type = block.optString("type")) {
                             "thinking" -> {
                                 rawBlocks[idx] = JSONObject(block.toString())
-                                onEvent(
+                                safeEmit(
                                     ApiEvent.BlockStart(idx, Step.Thinking())
                                 )
                             }
 
                             "text" -> {
                                 rawBlocks[idx] = JSONObject(block.toString())
-                                onEvent(ApiEvent.BlockStart(idx, Step.Text()))
+                                safeEmit(ApiEvent.BlockStart(idx, Step.Text()))
                             }
 
                             // 4a-2：客户端工具调用（不是服务端 server_tool_use）
@@ -1052,13 +1144,13 @@ class DeepSeekApi(
                                 if (input != null && input.length() > 0) {
                                     toolUseInitial[idx] = input.toString()
                                 }
-                                onEvent(ApiEvent.ToolUseStart(idx, id, name))
+                                safeEmit(ApiEvent.ToolUseStart(idx, id, name))
                             }
 
                             "server_tool_use" -> {
                                 toolCalls++
                                 if (maxRounds > 0 && toolCalls > maxRounds) {
-                                    onEvent(ApiEvent.Limit(maxRounds))
+                                    safeEmit(ApiEvent.Limit(maxRounds))
                                     return
                                 }
                                 lastToolInput = block.optJSONObject("input")
@@ -1068,7 +1160,7 @@ class DeepSeekApi(
                                 val queries = (lastToolInput?.optJSONArray("queries") ?: JSONArray()).let { a ->
                                     (0 until a.length()).map { a.optString(it) }
                                 }
-                                onEvent(
+                                safeEmit(
                                     ApiEvent.BlockStart(
                                         idx,
                                         Step.Search(queries = queries, results = parseResults(block))
@@ -1078,7 +1170,7 @@ class DeepSeekApi(
 
                             "web_fetch_tool_result" -> {
                                 val url = lastToolInput?.optString("url").orEmpty()
-                                onEvent(
+                                safeEmit(
                                     ApiEvent.BlockStart(
                                         idx,
                                         Step.Fetch(url = url, results = parseResults(block))
@@ -1098,12 +1190,12 @@ class DeepSeekApi(
                             "text_delta" -> {
                                 val t = delta.optString("text")
                                 rawBlocks[idx]?.put("text", rawBlocks[idx]?.optString("text").orEmpty() + t)
-                                onEvent(ApiEvent.Delta(idx, t))
+                                safeEmit(ApiEvent.Delta(idx, t))
                             }
                             "thinking_delta" -> {
                                 val t = delta.optString("thinking")
                                 rawBlocks[idx]?.put("thinking", rawBlocks[idx]?.optString("thinking").orEmpty() + t)
-                                onEvent(ApiEvent.Delta(idx, t))
+                                safeEmit(ApiEvent.Delta(idx, t))
                             }
                             // thinking 签名：Anthropic 兼容在 signature_delta 里给
                             "signature_delta" -> {
@@ -1127,7 +1219,7 @@ class DeepSeekApi(
                             "input",
                             runCatching { JSONObject(inputJson) }.getOrDefault(JSONObject())
                         )
-                        onEvent(ApiEvent.ToolUseEnd(idx, meta.first, meta.second, inputJson))
+                        safeEmit(ApiEvent.ToolUseEnd(idx, meta.first, meta.second, inputJson))
                     }
 
                     "message_delta" -> {
@@ -1144,7 +1236,7 @@ class DeepSeekApi(
                             } else {
                                 startCacheReadTokens
                             }
-                            onEvent(
+                            safeEmit(
                                 ApiEvent.Usage(
                                     // 服务端实测 start/delta 的 input 相等；按 Anthropic 语义以 delta 累计值为准，缺失才回退 start。
                                     promptTokens = rawPrompt,
@@ -1152,6 +1244,7 @@ class DeepSeekApi(
                                     completionTokens = u.optInt("output_tokens", 0),
                                     model = modelName,
                                     safetyTokens = safetyTokensOf(u),
+                                    thinkingTokens = thinkingTokensOf(u),
                                     source = "message_delta",
                                     rawUsage = u.toString()
                                 )
@@ -1160,7 +1253,7 @@ class DeepSeekApi(
                         val delta = o.optJSONObject("delta")
                         // 会话标题：流式在 message_delta 的 delta.title（官方 conversation_title 文档）
                         val generatedTitle = delta?.optString("title").orEmpty()
-                        if (generatedTitle.isNotBlank()) onEvent(ApiEvent.Title(generatedTitle))
+                        if (generatedTitle.isNotBlank()) safeEmit(ApiEvent.Title(generatedTitle))
                         val stop = delta?.optString("stop_reason")
                         // 拒答说明：stop_details 可能跟 stop_reason 一起在 delta 里，也可能在事件顶层；
                         // 图片被拦时 explanation 会写明是哪几张图
@@ -1168,12 +1261,16 @@ class DeepSeekApi(
                             ?: o.optJSONObject("stop_details")
                         val explanation = stopDetails?.optString("explanation")
                             ?.takeIf { it.isNotBlank() && it != "null" }
-                        if (rawBlocks.isNotEmpty()) {
+                        lastStopReason = stop
+                        lastExplanation = explanation
+                        if (rawBlocks.isNotEmpty() && !rawEmitted) {
+                            rawEmitted = true
                             val raw = JSONArray()
                             rawBlocks.values.forEach { raw.put(it) }
-                            onEvent(ApiEvent.AssistantRaw(raw.toString()))
+                            safeEmit(ApiEvent.AssistantRaw(raw.toString()))
                         }
-                        onEvent(ApiEvent.Done(stop, toolCalls, explanation))
+                        // stop_reason == "max_tokens" 时 ChatScreen 据此展示「输出被截断」标记
+                        safeEmit(ApiEvent.Done(stop, toolCalls, explanation))
                     }
                 }
             }
@@ -1184,18 +1281,50 @@ class DeepSeekApi(
             }
         }
 
-        while (true) {
-            val line = source.readUtf8Line() ?: break
-            when {
-                line.isEmpty() -> dispatch()
-                line.startsWith("event:") -> event = line.removePrefix("event:").trim()
-                line.startsWith("data:") -> {
-                    if (data.isNotEmpty()) data.append('\n')
-                    data.append(line.removePrefix("data:").trim())
+        // 空闲看门狗：连续 120 秒没有任何 SSE 行（含心跳/注释行）→ 主动取消请求并报错
+        val watchdog = Thread({
+            try {
+                while (!terminal.get()) {
+                    Thread.sleep(1_000L)
+                    if (terminal.get()) break
+                    if (System.currentTimeMillis() - lastActivity.get() >= STREAM_IDLE_TIMEOUT_MS) {
+                        safeEmit(ApiEvent.Failed(STREAM_IDLE_TIMEOUT))
+                        runCatching { call.cancel() }
+                        break
+                    }
+                }
+            } catch (_: InterruptedException) {
+            }
+        }, "deepseek-sse-watchdog").apply { isDaemon = true }
+        watchdog.start()
+        try {
+            while (true) {
+                val line = source.readUtf8Line() ?: break
+                lastActivity.set(System.currentTimeMillis())
+                when {
+                    line.isEmpty() -> dispatch()
+                    line.startsWith("event:") -> event = line.removePrefix("event:").trim()
+                    line.startsWith("data:") -> {
+                        if (data.isNotEmpty()) data.append('\n')
+                        data.append(line.removePrefix("data:").trim())
+                    }
                 }
             }
+            dispatch()
+            // 官方正常流一定以 message_stop/message_delta 收尾；EOF 时还没 Done = 响应不完整。
+            // 已经发过 Failed（error 事件/看门狗）时这里不再重复。
+            if (!doneEmitted && !terminal.get()) {
+                safeEmit(ApiEvent.Failed(STREAM_EOF_INCOMPLETE))
+            }
+        } catch (t: Throwable) {
+            if (!doneEmitted && !terminal.get()) {
+                safeEmit(ApiEvent.Failed(
+                    t.message?.takeIf { it.isNotBlank() } ?: STREAM_EOF_INCOMPLETE
+                ))
+            }
+        } finally {
+            watchdog.interrupt()
         }
-        dispatch()
     }
 
     /** 总输入 tokens = 未命中 input_tokens + 缓存命中 + 缓存写入（官方：后两者不要漏算输入） */
@@ -1212,6 +1341,24 @@ class DeepSeekApi(
      */
     private fun safetyTokensOf(usage: JSONObject): Int =
         usage.optJSONObject("output_tokens_details")?.optInt("safety_tokens", 0) ?: 0
+
+    /**
+     * 思考 token 数：`usage.output_tokens_details.thinking_tokens`。
+     * 官方：已包含在 output_tokens 里，只透传，不二次求和。
+     */
+    private fun thinkingTokensOf(usage: JSONObject): Int =
+        usage.optJSONObject("output_tokens_details")?.optInt("thinking_tokens", 0) ?: 0
+
+    /** 流式 error 事件的可读文案（兼容 `error.message/type` 与顶层 `message`） */
+    private fun sseErrorMessage(o: JSONObject): String {
+        val e = o.optJSONObject("error")
+        val msg = e?.optString("message").orEmpty()
+            .ifBlank { o.optString("message") }
+            .ifBlank { "服务端返回错误" }
+        val type = e?.optString("type").orEmpty().ifBlank { o.optString("type") }
+        val suffix = if (type.isNotBlank() && type != "error" && !msg.contains(type)) "（$type）" else ""
+        return "流式错误：$msg$suffix"
+    }
 
     private fun parseResults(block: JSONObject): List<Source> {
         val arr = block.optJSONArray("content") ?: return emptyList()

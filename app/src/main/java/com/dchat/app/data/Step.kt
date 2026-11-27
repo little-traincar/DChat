@@ -43,6 +43,14 @@ sealed class Step {
         val args: String = "",
         val result: String = "",
         val error: String = "",
-        val durationMs: Long = 0L
+        val durationMs: Long = 0L,
+        /**
+         * 1.0.3：Python/用户工具输出超过 64KB 时，完整内容落盘的绝对路径（否则 null）。
+         * 只用于气泡卡片的「完整输出」入口；给模型的 tool_result 已在 ChatScreen 截到 64KB。
+         * 该字段不落库（重启后卡片不再显示入口），避免把工作区绝对路径写进会话 JSON。
+         */
+        val outputPath: String? = null,
+        /** 完整输出文件的字节数（outputPath 为空时为 0） */
+        val outputBytes: Long = 0L
     ) : Step()
 }

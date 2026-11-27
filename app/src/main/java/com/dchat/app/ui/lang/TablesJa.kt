@@ -173,7 +173,14 @@ internal fun chatJa(): ChatStr = ChatStr(
     stopped = "停止しました",
     stoppedEmpty = "停止しました（生成内容なし）",
     deleteChatFilesHint = "この会話には %d 個のファイル（合計 %s）があります。会話を削除するとこれらのファイルも削除されます。",
-    downloadSaveToPhone = "スマートフォンに保存"
+    downloadSaveToPhone = "スマートフォンに保存",
+    answerTruncated = "回答が出力上限に達したため、途中で切り詰められました",
+    docLimitNotice = "このリクエストの参照文書が公式上限（最大 %d 個）を超えたため、超過分は切り詰められました",
+    toolStoppedResult = "ユーザーが停止したため、ツールは実行されませんでした",
+    sizeUnknown = "サイズ不明",
+    pythonOutputSaved = "完全な出力は %s に保存されました（%s）。必要なら fs.read で先頭から読み取れます。",
+    pythonFullOutput = "完全な出力：%s（%s）",
+    previewTruncated = "（先頭 %s のみ表示。完全な内容は会話ファイルにあります）"
 )
 
 internal fun settingsJa(): SettingsStr = SettingsStr(
@@ -386,6 +393,9 @@ internal fun toolsJa(): ToolsStr = ToolsStr(
     names = mapOf(
         "server.web_search" to "ウェブ検索",
         "server.read_url" to "リンクを読む",
+        "local.web_search" to "ウェブ検索",
+        "local.web_fetch" to "リンクを読む",
+        "local.tool_list" to "ツール一覧",
         "server.thinking" to "深い思考",
         "server.document_parse" to "ファイル解析",
         "server.ocr" to "画像文字認識",

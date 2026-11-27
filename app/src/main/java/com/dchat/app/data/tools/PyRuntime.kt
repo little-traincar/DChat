@@ -52,7 +52,15 @@ data class PyResult(
     /** local.imagegen：本次成功落盘的全部图片 */
     val files: List<PyFile> = emptyList(),
     /** local.imagegen：部分失败时按张序号列出的原因 */
-    val failures: List<PyFailure> = emptyList()
+    val failures: List<PyFailure> = emptyList(),
+    /**
+     * local.python / 用户工具：输出超过 64KB 时，完整输出（≤1MB）会落盘到
+     * `<会话工作区>/python_out.txt`，这里返回该文件绝对路径（否则 null）。
+     * ChatScreen 负责把它拼进给模型的提示里（TOOL_OUTPUT_LIMIT 截断也在 ChatScreen 侧）。
+     */
+    val outputPath: String? = null,
+    /** local.web_search / local.web_fetch：结构化来源，供时间线渲染搜索/打开链接卡片 */
+    val sources: List<com.dchat.app.data.Source> = emptyList()
 )
 
 /**
@@ -62,8 +70,10 @@ data class PyResult(
  *   工具入口/编辑器显示「Python 运行时不可用」，App 不崩；
  * - 所有用户代码在单线程 Executor 里执行（解释器全局串行），Kotlin 侧 `Future.get(timeout)`；
  *   超时后**只能取消 Future，无法强杀 Python 线程**（报告里注明），返回 TOOL_TIMEOUT；
- * - 输出超过 64KB 截断（保头尾 + 省略字符数）；
- * - import 白名单/沙箱 open 由内置 `src/main/python/dchat_runner.py` 执行。
+ * - 本地收集输出上限 **1MB**（[OUTPUT_LIMIT]）；超过 **64KB** 时把完整内容写到会话工作区的
+ *   `python_out.txt` 并在 [PyResult.outputPath] 返回路径，回给模型的截断交给 ChatScreen；
+ * - 内存：单次执行软限 256MB、解释器总硬限 512MB（IN_PROCESS 共享 App 进程，见 [rssBytes] 注释）；
+ * - import 限制已放开（全部标准库）；open 仍由 `src/main/python/dchat_runner.py` 限制在沙箱内。
  */
 object PyRuntime {
 
@@ -81,7 +91,15 @@ object PyRuntime {
     var lastError by mutableStateOf<String?>(null)
         private set
 
-    private const val OUTPUT_LIMIT = 64 * 1024
+    private const val OUTPUT_LIMIT = 1024 * 1024
+    /** 超过该长度就把完整输出落盘 python_out.txt（回给模型时由 ChatScreen 截到 TOOL_OUTPUT_LIMIT） */
+    private const val OUTPUT_FILE_HINT_LIMIT = 64 * 1024
+    private const val OUTPUT_FILE_NAME = "python_out.txt"
+    /** 单次执行内存软限：256MB（IN_PROCESS 测量进程 RSS 增量） */
+    private const val SOFT_MEMORY_LIMIT_BYTES = 256L * 1024 * 1024
+    /** 解释器总硬限：512MB；IN_PROCESS 只能标记不可用并提示重启（无法强杀 Python 线程） */
+    private const val HARD_MEMORY_LIMIT_BYTES = 512L * 1024 * 1024
+    private const val MEMORY_POLL_MS = 200L
     private const val INIT_WAIT_MS = 20_000L
 
     private val initLock = Any()
@@ -183,24 +201,24 @@ object PyRuntime {
                     conversationMode
                 ).toString()
             })
-            val raw = try {
-                future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            } catch (e: TimeoutException) {
-                future.cancel(true)
-                return@withContext PyResult(
-                    ok = false,
-                    errorCode = "TOOL_TIMEOUT",
-                    errorMessage = "Python 代码执行超时（${timeoutMs / 1000}s），已丢弃结果"
+            val outcome = awaitWithMemoryGuard(future, timeoutMs.toLong())
+            when (outcome) {
+                is AwaitOutcome.Ok -> parseResult(context, conversationId, outcome.raw)
+                AwaitOutcome.Timeout -> timeoutResult(timeoutMs, "代码执行")
+                AwaitOutcome.MemorySoft -> PyResult(
+                    ok = false, errorCode = "MEMORY_LIMIT",
+                    errorMessage = "单次执行内存超过 256MB，已丢弃结果；请减少数据量或拆分执行"
                 )
-            } catch (e: ExecutionException) {
-                val cause = e.cause ?: e
-                return@withContext PyResult(
-                    ok = false,
-                    errorCode = "TOOL_ERROR",
-                    errorMessage = cause.message ?: cause.javaClass.simpleName
+                AwaitOutcome.MemoryHard -> PyResult(
+                    ok = false, errorCode = "PY_UNAVAILABLE",
+                    errorMessage = pyUnavailableMessage("内存超限（512MB），请重启 App 或重置 Python 运行环境")
                 )
+                is AwaitOutcome.Error -> {
+                    val cause = outcome.cause
+                    PyResult(ok = false, errorCode = "TOOL_ERROR",
+                        errorMessage = cause.message ?: cause.javaClass.simpleName)
+                }
             }
-            parseResult(raw)
         } catch (t: Throwable) {
             PyResult(ok = false, errorCode = "TOOL_ERROR", errorMessage = t.message ?: t.javaClass.simpleName)
         }
@@ -301,25 +319,24 @@ object PyRuntime {
                 ).toString()
                 raw
             })
-            val raw = try {
-                future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            } catch (e: TimeoutException) {
-                // Python 线程无法强杀：丢弃结果，仅取消 Future
-                future.cancel(true)
-                return@withContext PyResult(
-                    ok = false,
-                    errorCode = "TOOL_TIMEOUT",
-                    errorMessage = "Python 工具执行超时（${timeoutMs / 1000}s），已丢弃结果"
+            val outcome = awaitWithMemoryGuard(future, timeoutMs.toLong())
+            when (outcome) {
+                is AwaitOutcome.Ok -> parseResult(context, conversationId, outcome.raw)
+                AwaitOutcome.Timeout -> timeoutResult(timeoutMs, "工具执行")
+                AwaitOutcome.MemorySoft -> PyResult(
+                    ok = false, errorCode = "MEMORY_LIMIT",
+                    errorMessage = "单次执行内存超过 256MB，已丢弃结果；请减少数据量或拆分执行"
                 )
-            } catch (e: ExecutionException) {
-                val cause = e.cause ?: e
-                return@withContext PyResult(
-                    ok = false,
-                    errorCode = "TOOL_ERROR",
-                    errorMessage = cause.message ?: cause.javaClass.simpleName
+                AwaitOutcome.MemoryHard -> PyResult(
+                    ok = false, errorCode = "PY_UNAVAILABLE",
+                    errorMessage = pyUnavailableMessage("内存超限（512MB），请重启 App 或重置 Python 运行环境")
                 )
+                is AwaitOutcome.Error -> {
+                    val cause = outcome.cause
+                    PyResult(ok = false, errorCode = "TOOL_ERROR",
+                        errorMessage = cause.message ?: cause.javaClass.simpleName)
+                }
             }
-            parseResult(raw)
         } catch (t: Throwable) {
             PyResult(
                 ok = false,
@@ -331,11 +348,100 @@ object PyRuntime {
         }
     }
 
-    private fun parseResult(raw: String): PyResult {
+    private sealed class AwaitOutcome {
+        class Ok(val raw: String) : AwaitOutcome()
+        object Timeout : AwaitOutcome()
+        object MemorySoft : AwaitOutcome()
+        object MemoryHard : AwaitOutcome()
+        class Error(val cause: Throwable) : AwaitOutcome()
+    }
+
+    /**
+     * 进程 RSS（字节）。IN_PROCESS 模式解释器与 App 同进程，无法单独测量解释器内存，
+     * 只能按「执行前后的增量」判断用户代码是否吃内存；CHILD 模式由子进程 RSS 单独限制。
+     */
+    private fun rssBytes(): Long = runCatching {
+        val statm = File("/proc/self/statm").readText().trim().split(" ")
+        val pages = statm.getOrNull(1)?.toLongOrNull() ?: 0L
+        pages * 4096L
+    }.getOrDefault(0L)
+
+    /**
+     * 等 Future 完成，同时每 200ms 采样一次 RSS：
+     * - 增量 > 256MB（软限）→ 取消 Future，返回 [AwaitOutcome.MemorySoft]（Python 线程无法强杀，结果丢弃）；
+     * - 增量 > 512MB（硬限）→ 标记运行时不可用（IN_PROCESS 无法重启解释器），返回 [AwaitOutcome.MemoryHard]。
+     */
+    private fun awaitWithMemoryGuard(
+        future: java.util.concurrent.Future<String>,
+        timeoutMs: Long
+    ): AwaitOutcome {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val baseline = rssBytes()
+        while (true) {
+            val remain = deadline - System.currentTimeMillis()
+            if (remain <= 0) {
+                future.cancel(true)
+                return AwaitOutcome.Timeout
+            }
+            try {
+                return AwaitOutcome.Ok(future.get(minOf(remain, MEMORY_POLL_MS), TimeUnit.MILLISECONDS))
+            } catch (_: TimeoutException) {
+                // 正常轮询
+            } catch (e: ExecutionException) {
+                return AwaitOutcome.Error(e.cause ?: e)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return AwaitOutcome.Error(e)
+            }
+            val now = rssBytes()
+            if (baseline > 0 && now > baseline) {
+                val growth = now - baseline
+                if (growth > HARD_MEMORY_LIMIT_BYTES) {
+                    future.cancel(true)
+                    state = State.FAILED
+                    lastError = "Python 解释器内存超过 512MB"
+                    return AwaitOutcome.MemoryHard
+                }
+                if (growth > SOFT_MEMORY_LIMIT_BYTES) {
+                    future.cancel(true)
+                    return AwaitOutcome.MemorySoft
+                }
+            }
+        }
+    }
+
+    private fun timeoutResult(timeoutMs: Int, what: String): PyResult = PyResult(
+        ok = false,
+        errorCode = "TOOL_TIMEOUT",
+        errorMessage = "Python ${what}超时（${timeoutMs / 1000}s），已丢弃结果"
+    )
+
+    /**
+     * 输出后处理（IN_PROCESS / CHILD 共用）：
+     * - 总量截到 1MB；
+     * - 超过 64KB 时把完整输出写到 `<会话工作区>/python_out.txt`，路径放进 [PyResult.outputPath]；
+     * - 回给模型的 64KB 截断由 ChatScreen 负责（这里保留完整 1MB）。
+     */
+    internal fun finalizeOutput(context: Context, conversationId: String, result: PyResult): PyResult {
+        if (!result.ok) return result
+        val full = truncate(result.output)
+        var path: String? = null
+        if (full.length > OUTPUT_FILE_HINT_LIMIT) {
+            path = runCatching {
+                val dir = FileTools.workspaceDir(context, conversationId).also { it.mkdirs() }
+                val f = File(dir, OUTPUT_FILE_NAME)
+                f.writeText(full)
+                f.absolutePath
+            }.onFailure { Log.w("PyRuntime", "写 python_out.txt 失败", it) }.getOrNull()
+        }
+        return result.copy(output = full, outputPath = path)
+    }
+
+    private fun parseResult(context: Context, conversationId: String, raw: String): PyResult {
         val o = runCatching { JSONObject(raw) }.getOrNull()
-            ?: return PyResult(ok = true, output = truncate(raw))
+            ?: return finalizeOutput(context, conversationId, PyResult(ok = true, output = raw))
         return if (o.optBoolean("ok", false)) {
-            PyResult(ok = true, output = truncate(o.optString("result")))
+            finalizeOutput(context, conversationId, PyResult(ok = true, output = o.optString("result")))
         } else {
             PyResult(
                 ok = false,

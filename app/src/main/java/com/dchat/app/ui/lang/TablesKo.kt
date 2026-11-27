@@ -173,7 +173,14 @@ internal fun chatKo(): ChatStr = ChatStr(
     stopped = "중지됨",
     stoppedEmpty = "중지됨(생성된 내용 없음)",
     deleteChatFilesHint = "이 대화에는 파일 %d개(총 %s)가 있습니다. 대화를 삭제하면 이 파일들도 삭제됩니다.",
-    downloadSaveToPhone = "휴대폰에 저장"
+    downloadSaveToPhone = "휴대폰에 저장",
+    answerTruncated = "응답이 출력 한도에 도달하여 잘렸습니다",
+    docLimitNotice = "이 요청의 참조 문서가 공식 한도(최대 %d개)를 초과하여 초과분이 잘렸습니다",
+    toolStoppedResult = "사용자가 중지하여 도구가 실행되지 않았습니다",
+    sizeUnknown = "크기 알 수 없음",
+    pythonOutputSaved = "전체 출력이 %s에 저장되었습니다(%s). 필요하면 fs.read로 앞부분을 읽을 수 있습니다.",
+    pythonFullOutput = "전체 출력: %s(%s)",
+    previewTruncated = "(앞부분 %s만 표시되며, 전체 내용은 대화 파일에 있습니다)"
 )
 
 internal fun settingsKo(): SettingsStr = SettingsStr(
@@ -386,6 +393,9 @@ internal fun toolsKo(): ToolsStr = ToolsStr(
     names = mapOf(
         "server.web_search" to "웹 검색",
         "server.read_url" to "링크 읽기",
+        "local.web_search" to "웹 검색",
+        "local.web_fetch" to "링크 읽기",
+        "local.tool_list" to "도구 목록",
         "server.thinking" to "깊은 사고",
         "server.document_parse" to "파일 분석",
         "server.ocr" to "이미지 문자 인식",

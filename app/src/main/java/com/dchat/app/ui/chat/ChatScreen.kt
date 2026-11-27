@@ -32,6 +32,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -123,6 +124,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -150,6 +152,7 @@ import com.dchat.app.data.api.ChatTurn
 import com.dchat.app.data.api.DeepSeekApi
 import com.dchat.app.data.api.EncodedChatImage
 import com.dchat.app.data.tools.BgTasks
+import com.dchat.app.data.tools.FileTools
 import com.dchat.app.data.tools.LocalToolRunner
 import com.dchat.app.data.tools.PyFailure
 import com.dchat.app.data.tools.PyFile
@@ -188,6 +191,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -220,11 +224,12 @@ fun ChatScreen(
 val toolSpecs = ToolRegistry.tools
     fun toolEnabled(id: String): Boolean = toolSpecs.firstOrNull { it.id == id }?.enabled == true
     val thinking = toolEnabled("server.thinking")
-    val search = toolEnabled("server.web_search")
+    // 1.0.3：搜索/阅读改为客户端工具 local.web_search / local.web_fetch（服务端内置工具已淘汰）
+    val search = toolEnabled("local.web_search")
     val ttsEnabled = toolEnabled("server.tts")
     val ocrEnabled = toolEnabled("server.ocr")
     fun setThinking(v: Boolean) = ToolRegistry.setEnabled("server.thinking", v)
-    fun setSearch(v: Boolean) = ToolRegistry.setEnabled("server.web_search", v)
+    fun setSearch(v: Boolean) = ToolRegistry.setEnabled("local.web_search", v)
     fun setTts(v: Boolean) = ToolRegistry.setEnabled("server.tts", v)
     var voice by remember { mutableStateOf(false) }
     var drawer by remember { mutableStateOf(false) }
@@ -243,6 +248,11 @@ var exportTarget by remember { mutableStateOf<List<Conversation>>(emptyList()) }
     // 只有用户点停止 / 新发一轮时才把 token 换掉，工具循环据此判断是否还该继续。
     var genToken by remember { mutableStateOf<Any?>(null) }
     var apiCall by remember { mutableStateOf<okhttp3.Call?>(null) }
+    // 1.0.3：生图占位卡的进度起点（elapsedRealtime 毫秒，0 = 当前没有进行中的生图）
+    var imageGenStartedAt by remember { mutableStateOf(0L) }
+    // D97：本轮工具链的实时快照。停止生成时用它补齐「assistant 有 tool_use 但没有配对 tool_result」
+    // 的悬空调用（否则下一轮请求 400）；正常结束时它也会清洗后落库给后续轮次。
+    val liveRawChain = remember { mutableStateListOf<JSONObject>() }
     var recording by remember { mutableStateOf(false) }
     var inputFocused by remember { mutableStateOf(false) }
     // 全屏看图：本次消息的全部图 + 当前点击的索引；null = 查看器关闭
@@ -250,6 +260,9 @@ var imageViewer by remember { mutableStateOf<Pair<List<String>, Int>?>(null) }
 
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    // 1.0.3：按会话记忆滚动位置（内存级，App 重启不保留）
+    val scrollMemory = remember { mutableStateMapOf<String, Pair<Int, Int>>() }
+    var scrollRestored by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
@@ -936,18 +949,39 @@ LaunchedEffect(listState, app.currentId) {
                 }
             }
             (list?.size ?: 0) to ((last?.text?.length ?: 0) + stepWeight)
-        }.collect { (n, _) -> if (follow && n > 0) stickToBottom() }
+        }.drop(1).collect { (n, _) -> if (follow && n > 0) stickToBottom() }
     }
 
+    // 1.0.3：切会话时恢复该会话上次的滚动位置；没记录过（或记录越界）才贴底。
+    // 之前这里无条件 follow=true + 贴底，导致「返回某个会话」总是被拽到最底部。
     LaunchedEffect(app.currentId) {
-        follow = true
-        stickToBottom()
+        val count = app.current()?.messages?.size ?: 0
+        val saved = app.currentId?.let { scrollMemory[it] }
+        if (saved != null && saved.first in 0 until count) {
+            follow = false
+            runCatching { listState.scrollToItem(saved.first, saved.second) }
+            // 等一帧布局完成；恢复后**保持不跟随**（布局未完成时 canScrollForward 不可靠，
+            // 用它判断会把刚恢复的位置又贴回底部）。用户手动滑到底会自动重新跟随。
+            withFrameNanos { }
+            runCatching { listState.scrollToItem(saved.first, saved.second) }
+        } else {
+            follow = true
+            stickToBottom()
+        }
+        scrollRestored = true
+    }
+
+    // 持续按会话记忆滚动位置（内存级）：firstVisibleItemIndex + offset。
+    // 放在恢复 effect 之后声明，保证切会话时先读到旧值再被新的滚动状态覆盖。
+    LaunchedEffect(listState, app.currentId) {
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .collect { pos -> app.currentId?.let { scrollMemory[it] = pos } }
     }
 
     // 键盘升降：视口高度一变就贴底。layoutInfo 在布局完成后才更新    // 所以这里的 clamp 基准是新视口，不会滚完还差一截
 LaunchedEffect(listState) {
         snapshotFlow { listState.layoutInfo.viewportSize.height }
-            .collect { if (follow) stickToBottom() }
+            .collect { if (follow && scrollRestored) stickToBottom() }
     }
 
     // 输入框获得焦点时，直接切到贴底模
@@ -1014,20 +1048,26 @@ val historyMsgs = messages.filter {
             .filter { it.fromMe && it.images.isNotEmpty() }
             .map { it.id }
             .toHashSet()
-        // 历史文档同样只在最近几条带文档的用户消息里重放        // 官方限制每个请求最多引20 个文档、文字合 MiB，超出会 400
-val replayDocs = HashMap<Long, List<String>>()
-        var docBudget = HISTORY_DOC_LIMIT
+        // 本条消息引用的服务端文档（去重 + 官方上限；先占预算）
+        val promptDocList = docs.map { it.fileId }.filter { it.isNotBlank() }.distinct()
+        val promptDocs = promptDocList.take(HISTORY_DOC_LIMIT)
+        // 1.0.3 / D97 ⑤：官方「每个请求最多引用 20 个文档」是**历史重放 + 本条**合并计数。
+        // 以前历史先占满 20、本条又 take(20)，合计最多 40 → 400。现在本条先占、历史只能用剩余名额。
+        var docOverflow = promptDocList.size > promptDocs.size
+        val replayDocs = HashMap<Long, List<String>>()
+        var docBudget = (HISTORY_DOC_LIMIT - promptDocs.size).coerceAtLeast(0)
         for (m in historyMsgs) {
-            if (!m.fromMe || m.docs.isEmpty() || docBudget <= 0) continue
-            val ids = m.docs.distinct().take(docBudget)
-            if (ids.isNotEmpty()) {
-                replayDocs[m.id] = ids
-                docBudget -= ids.size
+            if (!m.fromMe || m.docs.isEmpty()) continue
+            val ids = m.docs.distinct()
+            if (docBudget <= 0) {
+                docOverflow = true
+                continue
             }
+            if (ids.size > docBudget) docOverflow = true
+            val take = ids.take(docBudget)
+            replayDocs[m.id] = take
+            docBudget -= take.size
         }
-        // 本条消息引用的服务端文档（去+ 官方 20 个上限）
-        val promptDocs = docs.map { it.fileId }.filter { it.isNotBlank() }
-            .distinct().take(HISTORY_DOC_LIMIT)
 
         val userMsg = ChatMsg(
             fromMe = true,
@@ -1087,8 +1127,8 @@ if (s0.apiKey.isBlank()) {
         val indexPos = HashMap<Int, Int>()
         // 缓存阶段 A：本轮最近一次 assistant 原始 content 块，用于历史原样回放
         var lastAssistantRaw = ""
-        // 缓存阶段 A：本轮实际追加的工具链（assistant/tool_result/...），结束时挂到最终 assistant
-        var rawChainMessages = mutableListOf<JSONObject>()
+        // D97：本轮实际追加的工具链放在 composable 级 liveRawChain 里（停止时要读它补配对）
+        liveRawChain.clear()
         var lastPushAt = 0L
         // SSE usage 先于 message_delta(Done) 到达；以最后一次上报为准（message_start 只带输入侧）
         var usage: ApiEvent.Usage? = null
@@ -1110,6 +1150,9 @@ val now = android.os.SystemClock.elapsedRealtime()
             if (done) {
                 val u = usage
                 val refusedText = refusal
+                // D97：rawAssistant 不再整条丢弃——清洗时 thinking 块（含 signature）原样保留，
+                // 只压缩 text；就算仍超限也不允许删 thinking（删了带 tools 的历史会 400）。
+                val rawForStore = if (RAW_REPLAY) sanitizeAssistantRawForStore(lastAssistantRaw) else ""
                 app.updateMessage(aiId) {
                     // 拒答：官方要求删除已流式下发的正文，换成我们的拒答文案；
                     // STATUS_REFUSED 让气泡保持中性文字色，不用红色错误样
@@ -1130,12 +1173,10 @@ if (refusedText != null) {
                         it.copy(
                             steps = snapshot,
                             text = txt,
-                            rawAssistant = lastAssistantRaw.takeIf {
-                                RAW_REPLAY && it.length <= RAW_ASSISTANT_MAX
-                            }.orEmpty(),
-                            rawTruncated = RAW_REPLAY && lastAssistantRaw.length > RAW_ASSISTANT_MAX,
-                            rawChain = if (RAW_REPLAY && rawChainMessages.size > 1) {
-                                sanitizeChainForStore(rawChainMessages)
+                            rawAssistant = rawForStore,
+                            rawTruncated = RAW_REPLAY && rawForStore.length < lastAssistantRaw.length,
+                            rawChain = if (RAW_REPLAY && liveRawChain.size > 1) {
+                                sanitizeChainForStore(liveRawChain.toList())
                             } else "",
                             status = ChatMsg.STATUS_FINISHED,
                             promptTokens = u?.promptTokens ?: it.promptTokens,
@@ -1151,6 +1192,23 @@ if (refusedText != null) {
             } else {
                 app.updateMessageLite(aiId) { it.copy(steps = snapshot, text = txt) }
             }
+        }
+
+        /**
+         * 结束气泡；官方 stop_reason=max_tokens（输出达到模型上限）时在末尾补一行「已截断」提示。
+         * D97 ④：必须让用户明确知道这不是完整回答。
+         */
+        fun finishWithTruncation(stopReason: String?) {
+            if (stopReason == "max_tokens") {
+                steps.add(Step.Text("\n\n" + L.chat.answerTruncated))
+            }
+            push(true)
+        }
+
+        // D97 ⑤：文档配额被截断时在气泡里明确提示（不用 Toast，避免连发时刷屏）
+        if (docOverflow) {
+            steps.add(Step.Text("\n\n" + L.format(L.chat.docLimitNotice, HISTORY_DOC_LIMIT)))
+            push(false)
         }
 
         val api = DeepSeekApi(s0.baseUrl, s0.apiKey)
@@ -1185,16 +1243,16 @@ job = scope.launch {
                         // 旧消息补齐 modelText；只写模型回放字段，不改可见 text
                         app.updateMessageLite(m.id) { it.copy(modelText = replayText) }
                     }
-            // 跨模型：旧 assistant 的 raw 元数据不能跨模型回放（DSH readReplay 同口径）
-            val sameModel = m.modelName.isBlank() ||
-                m.modelName == s0.modelName.ifBlank { "deepseek-flash" }
+            // 1.0.3 / D97：跨模型也回放 raw（尤其 thinking 块 + signature）。官方不校验签名，
+            // 反过来「跨模型就整条丢 raw」会让带 tools 的历史缺 thinking 而 400；只有模型专属的
+            // 其它字段目前没有（tool_use/text 都是通用块），无需额外剥离。
             turns.add(
                 ChatTurn(
                     fromMe = m.fromMe,
                     text = replayText,
                     images = imgs,
-                    rawAssistant = if (m.fromMe || !RAW_REPLAY || !sameModel) "" else m.rawAssistant,
-                    rawChain = if (m.fromMe || !RAW_REPLAY || !sameModel) "" else m.rawChain,
+                    rawAssistant = if (m.fromMe || !RAW_REPLAY) "" else m.rawAssistant,
+                    rawChain = if (m.fromMe || !RAW_REPLAY) "" else m.rawChain,
                             // 之前各轮latest_reminder 原样回传（官方建议，能提升上下文缓存命中
 reminder = if (m.fromMe) m.reminder else "",
                             // 服务端解析文档：历史轮也要重file_id，多轮才能接着问同一份文
@@ -1509,12 +1567,12 @@ val ToolLoop = object {
                                                     continueWithTools(uses, extra, callRaw)
                                                 } else {
                                                     if (callRaw.isNotBlank()) {
-                                                        rawChainMessages.add(
+                                                        liveRawChain.add(
                                                             JSONObject().put("role", "assistant")
                                                                 .put("content", JSONArray(callRaw))
                                                         )
                                                     }
-                                                    push(true)
+                                                    finishWithTruncation(ev.stopReason)
                                                 }
                                             }
 
@@ -1608,6 +1666,17 @@ val ToolLoop = object {
                         // local.imagegen：一次可能产出多张图 + 部分失败（成功图不丢）
                         var genFiles: List<PyFile> = emptyList()
                         var genFailures: List<PyFailure> = emptyList()
+                        // 1.0.3：Python/用户工具输出超 64KB 时，完整输出落盘路径
+                        var outputPath: String? = null
+                        // 1.0.3：web_search / web_fetch 的结构化来源（渲染搜索/打开链接卡片，与旧服务端工具一致）
+                        var webSources: List<com.dchat.app.data.Source> = emptyList()
+                        var webQuery = ""
+                        var webUrl = ""
+                        runCatching {
+                            val inObj = JSONObject(u.inputJson)
+                            webQuery = inObj.optString("query")
+                            webUrl = inObj.optString("url")
+                        }
                         if (spec == null) {
                             errorCode = "TOOL_NOT_FOUND"
                             errorMsg = "模型返回了未知工具：${u.name}"
@@ -1627,6 +1696,8 @@ val ToolLoop = object {
                                     note = L.imageGen.generating
                                 )
                                 genPlaceholder = ph
+                                // 1.0.3：占位卡要显示「已用时 Ns」，记下开始时刻（elapsedRealtime）
+                                imageGenStartedAt = android.os.SystemClock.elapsedRealtime()
                                 steps.add(ph)
                                 // 绕过 push 的 30fps 节流，让占位卡立刻出现
                                 lastPushAt = 0L
@@ -1681,6 +1752,7 @@ val ToolLoop = object {
                                 }
                             }
                             // 结果回来就撤掉占位卡；被用户停止时由 stop() 兜底清理
+                            imageGenStartedAt = 0L
                             if (genPlaceholder != null) {
                                 steps.removeAll { item -> (item as? Step.Download) === genPlaceholder }
                             }
@@ -1693,6 +1765,8 @@ val ToolLoop = object {
                             dlSize = r.sizeBytes
                             genFiles = r.files
                             genFailures = r.failures
+                            outputPath = r.outputPath
+                            webSources = r.sources
                             if (ok) noteToolSuccess(spec.id)
                             else if (errorCode != "PY_UNAVAILABLE") noteToolFailure(spec.id)
                         }
@@ -1704,6 +1778,23 @@ val ToolLoop = object {
                             output
                         } else {
                             (errorCode ?: "TOOL_ERROR") + ": " + (errorMsg ?: "")
+                        }
+                        // 1.0.3：Python/用户工具输出超过 64KB 时，完整内容（≤1MB）已落盘，
+                        // PyResult.outputPath 给出路径。回给模型的文本只取 TOOL_OUTPUT_LIMIT，
+                        // 并附一句「完整输出在哪、怎么用 fs.read 读」的提示。
+                        var pythonOutputHint = ""
+                        val outPath = outputPath
+                        if (ok && !outPath.isNullOrBlank()) {
+                            val outFile = File(outPath)
+                            val rel = runCatching {
+                                outFile.relativeTo(FileTools.workspaceDir(ctx, convId)).path
+                            }.getOrElse { outPath.substringAfterLast('/') }
+                            val bytes = runCatching { outFile.length() }.getOrDefault(0L)
+                            pythonOutputHint = "\n\n" + L.format(
+                                L.chat.pythonOutputSaved,
+                                rel,
+                                formatImageSize(bytes.coerceAtLeast(0L))
+                            )
                         }
                         if (spec?.id == "local.download") {
                             steps.add(
@@ -1749,6 +1840,17 @@ val ToolLoop = object {
                                     )
                                 )
                             }
+                        } else if (spec?.id == "local.web_search" && ok && webSources.isNotEmpty()) {
+                            // 与旧服务端联网工具一致的「搜索了 N 个来源」卡片
+                            steps.add(
+                                Step.Search(
+                                    queries = listOf(webQuery).filter { it.isNotBlank() },
+                                    results = webSources
+                                )
+                            )
+                        } else if (spec?.id == "local.web_fetch" && ok && webSources.isNotEmpty()) {
+                            // 与旧服务端联网工具一致的「打开链接」卡片
+                            steps.add(Step.Fetch(url = webUrl, results = webSources))
                         } else {
                             steps.add(
                                 Step.ToolCall(
@@ -1757,7 +1859,12 @@ val ToolLoop = object {
                                     args = u.inputJson.take(500),
                                     result = if (ok) output.take(4000) else "",
                                     error = if (ok) "" else resultText.take(1000),
-                                    durationMs = elapsed
+                                    durationMs = elapsed,
+                                    // 1.0.3：Python 输出 >64KB 时完整输出的落盘路径（气泡卡片可点查看）
+                                    outputPath = outputPath,
+                                    outputBytes = outputPath?.let {
+                                        runCatching { File(it).length() }.getOrDefault(0L)
+                                    } ?: 0L
                                 )
                             )
                         }
@@ -1848,15 +1955,16 @@ val ToolLoop = object {
                                 }
                             }
                         }
-                        val resultTextForModel = if (inlineNotice.isBlank()) {
-                            resultText
-                        } else {
-                            resultText + "\n\n" + inlineNotice
+                        // 回给模型的文本：正文最多 TOOL_OUTPUT_LIMIT（64KB 字符），再拼落盘/内联提示
+                        val resultTextForModel = buildString {
+                            append(resultText.take(TOOL_OUTPUT_LIMIT))
+                            if (inlineNotice.isNotBlank()) append("\n\n").append(inlineNotice)
+                            if (pythonOutputHint.isNotBlank()) append(pythonOutputHint)
                         }
                         val resultBlocks = JSONArray()
                         resultBlocks.put(
                             JSONObject().put("type", "text")
-                                .put("text", resultTextForModel.take(TOOL_OUTPUT_LIMIT))
+                                .put("text", resultTextForModel)
                         )
                         inlineEncoded.forEach { (mime, bytes, b64) ->
                             // 压缩/预算都过完后再兜一层：至少保证是图片且不是空字节
@@ -1878,7 +1986,9 @@ val ToolLoop = object {
                                 .put("tool_use_id", u.id)
                                 .put(
                                     "content",
-                                    if (resultBlocks.length() > 1 || inlineNotice.isNotBlank()) {
+                                    if (resultBlocks.length() > 1 || inlineNotice.isNotBlank() ||
+                                        pythonOutputHint.isNotBlank()
+                                    ) {
                                         resultBlocks
                                     } else {
                                         resultText.take(TOOL_OUTPUT_LIMIT)
@@ -1908,7 +2018,8 @@ val ToolLoop = object {
                         ) + JSONObject()
                         .put("role", "user")
                         .put("content", resultContent)
-                    rawChainMessages = nextExtra.toMutableList()
+                    liveRawChain.clear()
+                    liveRawChain.addAll(nextExtra)
                     stream(nextExtra)
                 }
             }
@@ -1991,12 +2102,12 @@ if (ev.stopReason == "refusal") {
                                             scope.launch { ToolLoop.continueWithTools(uses, emptyList(), lastAssistantRaw) }
                                         } else {
                                             if (lastAssistantRaw.isNotBlank()) {
-                                                rawChainMessages.add(
+                                                liveRawChain.add(
                                                     JSONObject().put("role", "assistant")
                                                         .put("content", JSONArray(lastAssistantRaw))
                                                 )
                                             }
-                                            push(true)
+                                            finishWithTruncation(ev.stopReason)
                                         }
                                     }
 
@@ -2061,6 +2172,7 @@ val msg = e.message ?: L.chat.requestBuildFailed
         apiCall?.cancel()
         apiCall = null
         genToken = null
+        imageGenStartedAt = 0L
         job?.cancel()
         job = null
         // 停止时同时取消正在跑的 TTS（synthesize/speak），否则语音气泡会卡在「合成中…」
@@ -2072,11 +2184,20 @@ val msg = e.message ?: L.chat.requestBuildFailed
         val wip = messages.lastOrNull { it.status == ChatMsg.STATUS_WIP }
         if (wip != null) {
             val body = speakableText(wip)
+            // D97：停止时如果本轮工具链里 assistant(tool_use) 已发出但还没有配对的 tool_result，
+            // 下一轮请求会 400「工具结果未配对」。这里补齐占位 tool_result 再落库；
+            // 已完整配对的链也顺手落库，避免停止后模型忘记刚做过的工具调用（D92）。
+            val repairedChain = if (RAW_REPLAY && liveRawChain.isNotEmpty()) {
+                sanitizeChainForStore(
+                    repairDanglingToolUses(liveRawChain.toList(), L.chat.toolStoppedResult)
+                )
+            } else ""
             app.updateMessage(wip.id) {
                 it.copy(
                     status = ChatMsg.STATUS_STOPPED,
                     voice = false,
                     text = if (body.isBlank()) L.chat.stoppedEmpty else it.text,
+                    rawChain = if (repairedChain.isNotBlank()) repairedChain else it.rawChain,
                     // 停止时撤掉生图的「生成中…」占位卡，避免一直转圈
                     steps = it.steps.filterNot { s ->
                         s is Step.Download && s.status == "generating"
@@ -2210,6 +2331,9 @@ onOpenImage = { imgs, index ->
                                     }
                                 }
                             },
+                            // 1.0.3：生图占位卡显示已用时 + 卡片内「取消」（调现有 stop()）
+                            generatingStartedAt = if (m.status == ChatMsg.STATUS_WIP) imageGenStartedAt else 0L,
+                            onStopGenerating = if (m.status == ChatMsg.STATUS_WIP) ({ stop() }) else null,
                         )
                     }
                 }
@@ -2653,7 +2777,11 @@ private fun MessageRow(
     onOpenImage: (List<String>, Int) -> Unit,
     onCopy: () -> Unit,
     onSpeak: () -> Unit,
-    onToggleVoiceText: () -> Unit = {}
+    onToggleVoiceText: () -> Unit = {},
+    /** 1.0.3：生图占位卡的开始时刻（elapsedRealtime 毫秒）；0 = 不显示已用时 */
+    generatingStartedAt: Long = 0L,
+    /** 1.0.3：生图占位卡里的「取消」，调用现有 stop()；null = 不显示按钮 */
+    onStopGenerating: (() -> Unit)? = null
 ) {
     val c = LocalColors.current
     val L = LocalStrings.current
@@ -2728,7 +2856,13 @@ VoiceMessageBubble(
                                 .background(c.bg2)
                                 .padding(horizontal = 12.dp, vertical = 10.dp)
                         ) {
-                            StepTimeline(m.steps, m.status == ChatMsg.STATUS_WIP, onOpenImage)
+                            StepTimeline(
+                                m.steps,
+                                m.status == ChatMsg.STATUS_WIP,
+                                onOpenImage,
+                                generatingStartedAt = generatingStartedAt,
+                                onStopGenerating = onStopGenerating
+                            )
                         }
                     } else {
                         Column(
@@ -3118,10 +3252,16 @@ private fun VoiceWave(progress: Float, active: Boolean) {
 private fun StepTimeline(
     steps: List<Step>,
     streaming: Boolean,
-    onOpenImage: (List<String>, Int) -> Unit = { _, _ -> }
+    onOpenImage: (List<String>, Int) -> Unit = { _, _ -> },
+    /** 1.0.3：生图占位卡开始时刻（elapsedRealtime）；0 = 不显示已用时 */
+    generatingStartedAt: Long = 0L,
+    /** 1.0.3：生图占位卡上的「取消」 */
+    onStopGenerating: (() -> Unit)? = null
 ) {
     val c = LocalColors.current
     val L = LocalStrings.current
+    // 1.0.3：Python/用户工具输出超 64KB 时给「完整输出」入口，点开在弹窗里看全文
+    var outputPreviewFile by remember { mutableStateOf<File?>(null) }
     // 同一条消息里所有图片下载：点任意一张都能左右滑
     val downloadImages = steps.filterIsInstance<Step.Download>()
         .filter { it.mime.startsWith("image/") && it.filePath.isNotBlank() && File(it.filePath).isFile }
@@ -3136,50 +3276,74 @@ private fun StepTimeline(
                     body = st.text
                 )
 
-                is Step.Search -> CollapsibleStep(
+                is Step.Search -> SourceStepCard(
                     icon = Icons.Rounded.Search,
                     title = if (st.results.isEmpty()) {
                         L.chat.stepSearching
                     } else {
                         L.format(L.chat.stepSearched, st.results.size)
                     },
-                    body = buildString {
-                        st.queries.forEach { append("· ").append(it).append('\n') }
-                        if (st.queries.isNotEmpty()) append('\n')
-                        st.results.forEach { append(it.title).append('\n').append(it.url).append("\n\n") }
-                    }.trim()
+                    queries = st.queries,
+                    sources = st.results
                 )
 
-                is Step.Fetch -> CollapsibleStep(
+                is Step.Fetch -> SourceStepCard(
                     icon = Icons.Rounded.Public,
                     title = if (st.results.isEmpty() && st.url.isBlank()) {
                         L.chat.stepOpening
                     } else {
                         L.format(L.chat.stepOpened, st.results.size.coerceAtLeast(1))
                     },
-                    body = st.url
+                    queries = if (st.url.isBlank()) emptyList() else listOf(st.url),
+                    sources = st.results
                 )
 
                 is Step.Download -> DownloadStepCard(
                     st,
                     imagePaths = downloadImages,
                     imageIndex = downloadImages.indexOf(st.filePath).coerceAtLeast(0),
-                    onOpenImages = onOpenImage
+                    onOpenImages = onOpenImage,
+                    generatingStartedAt = generatingStartedAt,
+                    onStopGenerating = onStopGenerating
                 )
 
-                is Step.ToolCall -> CollapsibleStep(
-                    icon = Icons.Rounded.Build,
-                    title = L.format(L.chat.toolCallTitle, st.toolName.ifBlank { st.toolId }),
-                    body = buildString {
-                        if (st.args.isNotBlank()) append(L.format(L.chat.toolCallArgs, st.args)).append('\n')
-                        if (st.result.isNotBlank()) append(L.format(L.chat.toolCallResult, st.result)).append('\n')
-                        if (st.durationMs > 0) append(L.format(L.chat.toolCallDuration, st.durationMs))
-                    }.trim(),
-                    failed = st.error.isNotBlank(),
-                    errorLine = if (st.error.isNotBlank()) {
-                        L.format(L.chat.toolCallError, st.error)
-                    } else ""
-                )
+                is Step.ToolCall -> {
+                    CollapsibleStep(
+                        icon = Icons.Rounded.Build,
+                        title = L.format(L.chat.toolCallTitle, st.toolName.ifBlank { st.toolId }),
+                        body = buildString {
+                            if (st.args.isNotBlank()) append(L.format(L.chat.toolCallArgs, st.args)).append('\n')
+                            if (st.result.isNotBlank()) append(L.format(L.chat.toolCallResult, st.result)).append('\n')
+                            if (st.durationMs > 0) append(L.format(L.chat.toolCallDuration, st.durationMs))
+                        }.trim(),
+                        failed = st.error.isNotBlank(),
+                        errorLine = if (st.error.isNotBlank()) {
+                            L.format(L.chat.toolCallError, st.error)
+                        } else ""
+                    )
+                    // 1.0.3：Python/用户工具输出 >64KB 时完整内容已落盘，给一个可点入口看全文
+                    val fullPath = st.outputPath
+                    if (st.error.isBlank() && !fullPath.isNullOrBlank()) {
+                        val fullFile = File(fullPath)
+                        if (fullFile.isFile) {
+                            Text(
+                                L.format(
+                                    L.chat.pythonFullOutput,
+                                    fullFile.name,
+                                    formatImageSize(
+                                        if (st.outputBytes > 0L) st.outputBytes else fullFile.length()
+                                    )
+                                ),
+                                fontSize = 11.sp,
+                                color = c.brand,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { outputPreviewFile = fullFile }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
 
                 is Step.Text -> {
                     // 连续text 块其实是同一条回答（工具轮次把它切成了多块）                    // 分开渲染会在接缝处多出换段落，所以合并后一次渲
@@ -3200,6 +3364,96 @@ val sb = StringBuilder()
             i++
         }
     }
+    // 完整输出预览弹窗（点「完整输出：python_out.txt（1.2MB）」打开）
+    outputPreviewFile?.let { f ->
+        TextOutputDialog(file = f, onDismiss = { outputPreviewFile = null })
+    }
+}
+
+private const val TEXT_PREVIEW_LIMIT = 256 * 1024
+
+/**
+ * 1.0.3：工具完整输出的只读文本查看弹窗（Python 输出 >64KB 落盘后的入口）。
+ * 超过 [TEXT_PREVIEW_LIMIT] 只显示前 256KB，并在底部注明完整内容在会话文件里。
+ */
+@Composable
+private fun TextOutputDialog(file: File, onDismiss: () -> Unit) {
+    val c = LocalColors.current
+    val L = LocalStrings.current
+    var content by remember(file) { mutableStateOf<String?>(null) }
+    var truncated by remember(file) { mutableStateOf(false) }
+    LaunchedEffect(file) {
+        val read = withContext(Dispatchers.IO) {
+            runCatching {
+                if (file.length() > TEXT_PREVIEW_LIMIT.toLong()) {
+                    val bytes = ByteArray(TEXT_PREVIEW_LIMIT)
+                    var total = 0
+                    file.inputStream().use { input ->
+                        while (total < bytes.size) {
+                            val n = input.read(bytes, total, bytes.size - total)
+                            if (n <= 0) break
+                            total += n
+                        }
+                    }
+                    String(bytes, 0, total, Charsets.UTF_8) to true
+                } else {
+                    file.readText() to false
+                }
+            }.getOrNull()
+        }
+        content = read?.first ?: ""
+        truncated = read?.second == true
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = c.bg,
+        title = {
+            Text(
+                file.name,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = c.text1,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                val body = content
+                if (body == null) {
+                    Text(L.chat.loading, fontSize = 12.sp, color = c.text3)
+                } else {
+                    Text(
+                        body.ifBlank { "—" },
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp,
+                        color = c.text2
+                    )
+                    if (truncated) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            L.format(
+                                L.chat.previewTruncated,
+                                formatImageSize(TEXT_PREVIEW_LIMIT.toLong())
+                            ),
+                            fontSize = 10.5.sp,
+                            color = c.text3
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(L.common.close, fontSize = 14.sp, color = c.text2)
+            }
+        }
+    )
 }
 
 @Composable
@@ -3207,7 +3461,11 @@ private fun DownloadStepCard(
     step: Step.Download,
     imagePaths: List<String> = emptyList(),
     imageIndex: Int = 0,
-    onOpenImages: (List<String>, Int) -> Unit = { _, _ -> }
+    onOpenImages: (List<String>, Int) -> Unit = { _, _ -> },
+    /** 1.0.3：生图执行中的开始时刻（elapsedRealtime）；>0 时显示「已用时 N 秒」 */
+    generatingStartedAt: Long = 0L,
+    /** 1.0.3：执行中的「取消」（复用聊天页的 stop()） */
+    onStopGenerating: (() -> Unit)? = null
 ) {
     val c = LocalColors.current
     val L = LocalStrings.current
@@ -3218,13 +3476,34 @@ private fun DownloadStepCard(
     val viewerIndex = imageIndex.coerceIn(0, viewerImages.lastIndex)
     fun openViewer() = onOpenImages(viewerImages, viewerIndex)
     val isImage = step.mime.startsWith("image/") && file.isFile
+    // 1.0.3：DownloadTool 在响应缺 Content-Length 时会把 sizeBytes 记成 0（假 0KB）。
+    // 展示层兜底取落盘文件的实际长度；仍取不到才显示「大小未知」。
+    val actualBytes = remember(step.filePath, step.sizeBytes) {
+        if (step.sizeBytes > 0L) step.sizeBytes else runCatching { file.length() }.getOrDefault(0L)
+    }
     // 失败卡 / 空路径 / 0 字节：没有可保存/查看的文件，不渲染按钮（只留错误信息）
-    val canUseFile = !failed && step.filePath.isNotBlank() && step.sizeBytes > 0L && file.isFile
+    val canUseFile = !failed && step.filePath.isNotBlank() && actualBytes > 0L && file.isFile
     val bitmap = remember(step.filePath, file.length()) {
         if (isImage) decodeChatPhoto(step.filePath, 1600) else null
     }
-    // 生图执行中的占位卡：转圈 +「生成中…」，不显示保存/打开按钮
+    // 生图执行中的占位卡：转圈 +「生成中… 已用时 N 秒」+「取消」按钮，不显示保存/打开按钮
     if (step.status == "generating") {
+        // 秒表：ImageGenTool 目前没暴露「第 K/3 次尝试」，先只显示已用时，等它暴露 K 再接
+        var elapsedSec by remember(step, generatingStartedAt) {
+            mutableStateOf(
+                if (generatingStartedAt > 0L) {
+                    ((android.os.SystemClock.elapsedRealtime() - generatingStartedAt) / 1000L).toInt()
+                } else 0
+            )
+        }
+        LaunchedEffect(step, generatingStartedAt) {
+            if (generatingStartedAt <= 0L) return@LaunchedEffect
+            while (true) {
+                delay(500)
+                elapsedSec =
+                    ((android.os.SystemClock.elapsedRealtime() - generatingStartedAt) / 1000L).toInt()
+            }
+        }
         Row(
             Modifier
                 .fillMaxWidth()
@@ -3240,7 +3519,21 @@ private fun DownloadStepCard(
                 modifier = Modifier.size(16.dp)
             )
             Spacer(Modifier.width(8.dp))
-            Text(L.imageGen.generating, fontSize = 12.sp, color = c.text2)
+            Text(
+                if (generatingStartedAt > 0L) {
+                    L.format(L.imageGen.generatingElapsed, elapsedSec)
+                } else {
+                    L.imageGen.generating
+                },
+                fontSize = 12.sp,
+                color = c.text2,
+                modifier = Modifier.weight(1f)
+            )
+            if (onStopGenerating != null) {
+                TextButton(onClick = onStopGenerating) {
+                    Text(L.common.cancel, fontSize = 12.sp, color = c.text2)
+                }
+            }
         }
         return
     }
@@ -3302,7 +3595,8 @@ private fun DownloadStepCard(
                     )
                     if (step.filePath.isNotBlank()) {
                         Text(
-                            "${formatDownloadSize(step.sizeBytes)} · ${step.mime.ifBlank { "application/octet-stream" }}",
+                            (if (actualBytes > 0L) formatDownloadSize(actualBytes) else L.chat.sizeUnknown) +
+                                " · " + step.mime.ifBlank { "application/octet-stream" },
                             fontSize = 10.5.sp,
                             color = c.text3
                         )
@@ -3430,6 +3724,137 @@ private fun saveDownloadToPhone(ctx: android.content.Context, file: File, mime: 
             ?: error("无法写入下载文件")
         Toast.makeText(ctx, "已保存到 下载/DChat", Toast.LENGTH_SHORT).show()
     }.onFailure { Toast.makeText(ctx, it.message ?: "保存失败", Toast.LENGTH_SHORT).show() }
+}
+
+/**
+ * 1.0.3：联网搜索 / 阅读链接的步骤卡片。
+ *
+ * 与旧版服务端联网工具的外观保持一致：折叠头 + 展开后的「来源子卡片」；
+ * 每张子卡片 = 标题 + 站点 + 摘要 + 链接，点击用**内置浏览器**打开。
+ */
+/** 来源链接可能是 http://；内置 WebView 默认禁止明文，统一升级到 https 再打开。 */
+private fun secureUrl(url: String): String =
+    if (url.startsWith("http://")) "https://" + url.removePrefix("http://") else url
+
+@Composable
+private fun SourceStepCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    queries: List<String>,
+    sources: List<Source>
+) {
+    val c = LocalColors.current
+    val openUrl = com.dchat.app.ui.LocalUrlOpener.current
+    var expanded by remember { mutableStateOf(false) }
+    val hasBody = queries.any { it.isNotBlank() } || sources.isNotEmpty()
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(c.bg)
+            .border(1.dp, c.line2, RoundedCornerShape(12.dp))
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = hasBody) { expanded = !expanded }
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = c.text3, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(7.dp))
+            Text(
+                title,
+                fontSize = 12.5.sp,
+                color = c.text2,
+                modifier = Modifier.weight(1f)
+            )
+            if (hasBody) {
+                Icon(
+                    if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                    null, tint = c.text3, modifier = Modifier.size(16.dp)
+                )
+            }
+        }
+        if (expanded && hasBody) {
+            Column(Modifier.padding(start = 10.dp, end = 10.dp, bottom = 10.dp)) {
+                if (queries.any { it.isNotBlank() }) {
+                    queries.filter { it.isNotBlank() }.forEach { q ->
+                        Text(
+                            "· $q",
+                            fontSize = 11.5.sp,
+                            color = c.text3,
+                            lineHeight = 17.sp,
+                            modifier = Modifier.padding(bottom = 2.dp)
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                }
+                sources.forEachIndexed { index, s ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = s.url.isNotBlank()) { openUrl(secureUrl(s.url)) }
+                            .padding(vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // 前导：地球图标（浅品牌底块）
+                        Box(
+                            Modifier
+                                .size(38.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(c.brand.copy(alpha = 0.10f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Rounded.Public,
+                                null,
+                                tint = c.brand,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                s.title.ifBlank { s.url },
+                                fontSize = 13.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = c.text1,
+                                lineHeight = 19.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            val site = s.site.orEmpty()
+                            val domain = s.url
+                                .removePrefix("https://").removePrefix("http://")
+                                .substringBefore('/').substringBefore('?')
+                            val meta = listOf(site, domain).filter { it.isNotBlank() }.joinToString(" · ")
+                            if (meta.isNotBlank()) {
+                                Text(
+                                    meta,
+                                    fontSize = 11.sp,
+                                    color = c.text3,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(top = 3.dp)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Icon(
+                            Icons.Rounded.ChevronRight,
+                            null,
+                            tint = c.text3.copy(alpha = 0.55f),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    if (index < sources.lastIndex) {
+                        Box(Modifier.fillMaxWidth().height(0.6.dp).background(c.line2))
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -4334,7 +4759,7 @@ private fun DeleteChatDialog(
 private const val HISTORY_IMAGE_MSGS = 6
 /** 缓存阶段 A：raw assistant 回放总开关；关掉完全回到旧拼装 */
 private const val RAW_REPLAY = true
-/** 单条 rawAssistant 上限（32KB），超限丢弃并标记 rawTruncated */
+/** 单条 rawAssistant 上限（32KB）：超限只压缩 text，thinking 块（含 signature）永远保留（D97） */
 private const val RAW_ASSISTANT_MAX = 32 * 1024
 /**
  * rawChain 单条上限。持久化前已把 tool_result 里的 image 块（base64）替换成占位文字，
@@ -4352,24 +4777,39 @@ private const val RAW_CHAIN_TEXT_BLOCK_MAX = 8 * 1024
  * 会在 tool_result 里带 base64 图片，一条链轻松超过 64KB 上限 → `takeIf` 整条丢弃 →
  * 后续轮次模型完全看不到这轮的工具调用，于是出现"自己做过的事说没做过"。
  *
- * 这里做两件事：
+ * 这里做三件事（1.0.3 / D97 更新）：
  * 1. 把 image 块替换成一行文字占位（图片本体在会话文件里，模型不需要 base64）；
- * 2. 单个文本块截断到 [RAW_CHAIN_TEXT_BLOCK_MAX]。
- * 清洗后链通常只有几 KB，能稳定落库，工具调用记录因此进入后续请求的历史。
+ * 2. 文本块截断到 [RAW_CHAIN_TEXT_BLOCK_MAX]；
+ * 3. **超限时逐级缩短文本块，绝不整条丢弃**：thinking 块（含 signature）必须原样保留——
+ *    带 tools 的历史缺 thinking 会让下一轮请求 400。只有文本块会被压缩，最后兜底返回链本身。
  */
 private fun sanitizeChainForStore(chain: List<JSONObject>): String {
+    if (chain.isEmpty()) return ""
+    var textCap = RAW_CHAIN_TEXT_BLOCK_MAX
+    while (true) {
+        val json = buildChainJson(chain, textCap)
+        if (json.length <= RAW_CHAIN_MAX || textCap == 0) return json
+        textCap = when {
+            textCap > 1024 -> 1024
+            textCap > 128 -> 128
+            else -> 0
+        }
+    }
+}
+
+private fun buildChainJson(chain: List<JSONObject>, textCap: Int): String {
     val out = JSONArray()
     for (msg in chain) {
         val role = msg.optString("role")
         if (role.isBlank()) continue
         val cleaned = JSONObject().put("role", role)
         when (val content = msg.opt("content")) {
-            is String -> cleaned.put("content", content.take(RAW_CHAIN_TEXT_BLOCK_MAX))
+            is String -> cleaned.put("content", content.take(textCap))
             is JSONArray -> {
                 val blocks = JSONArray()
                 for (i in 0 until content.length()) {
                     val block = content.optJSONObject(i) ?: continue
-                    blocks.put(sanitizeChainBlock(block))
+                    blocks.put(sanitizeChainBlock(block, textCap))
                 }
                 cleaned.put("content", blocks)
             }
@@ -4377,32 +4817,106 @@ private fun sanitizeChainForStore(chain: List<JSONObject>): String {
         }
         out.put(cleaned)
     }
-    return out.toString().takeIf { it.length <= RAW_CHAIN_MAX }.orEmpty()
+    return out.toString()
 }
 
-/** 单个 content 块：去掉 image（换成文字占位），tool_result 的内部 content 递归处理，文本块截断 */
-private fun sanitizeChainBlock(block: JSONObject): JSONObject {
+/** 单个 content 块：去掉 image（换成文字占位），tool_result 的内部 content 递归处理，文本块按 textCap 截断 */
+private fun sanitizeChainBlock(block: JSONObject, textCap: Int): JSONObject {
     val type = block.optString("type")
     if (type == "image") {
         return JSONObject().put("type", "text").put("text", "[图片已省略：原图保存在会话文件里]")
     }
+    // D97：thinking / redacted_thinking 原样保留（含 signature），任何情况下都不许裁掉
+    if (type == "thinking" || type == "redacted_thinking") return JSONObject(block.toString())
     val copy = JSONObject(block.toString())
     when (val inner = block.opt("content")) {
         is JSONArray -> {
             val arr = JSONArray()
             for (i in 0 until inner.length()) {
                 val child = inner.optJSONObject(i) ?: continue
-                arr.put(sanitizeChainBlock(child))
+                arr.put(sanitizeChainBlock(child, textCap))
             }
             copy.put("content", arr)
         }
-        is String -> copy.put("content", inner.take(RAW_CHAIN_TEXT_BLOCK_MAX))
+        is String -> copy.put("content", inner.take(textCap))
         else -> Unit
     }
     if (type == "text") {
-        copy.put("text", block.optString("text").take(RAW_CHAIN_TEXT_BLOCK_MAX))
+        copy.put("text", block.optString("text").take(textCap))
     }
     return copy
+}
+
+/**
+ * 1.0.3 / D97：清洗要落库的 rawAssistant（assistant content 块 JSON 数组）。
+ *
+ * 以前超过 32KB 整条丢弃；但「请求带 tools 时历史必须回传 thinking 块（含 signature）」，
+ * 整条丢会让下一轮 400。现在：thinking / redacted_thinking 永远原样保留，
+ * 只按预算压缩 text 块；即使 text 压到 0 仍超限也返回（thinking 优先，不丢）。
+ */
+private fun sanitizeAssistantRawForStore(raw: String): String {
+    if (raw.isBlank()) return ""
+    val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return ""
+    if (arr.length() == 0) return ""
+    var textCap = 8 * 1024
+    while (true) {
+        val out = JSONArray()
+        for (i in 0 until arr.length()) {
+            val block = arr.optJSONObject(i) ?: continue
+            val type = block.optString("type")
+            when {
+                type == "thinking" || type == "redacted_thinking" ->
+                    out.put(JSONObject(block.toString()))
+                type == "text" -> {
+                    val copy = JSONObject(block.toString())
+                    copy.put("text", block.optString("text").take(textCap))
+                    out.put(copy)
+                }
+                else -> out.put(JSONObject(block.toString()))
+            }
+        }
+        val json = out.toString()
+        if (json.length <= RAW_ASSISTANT_MAX || textCap == 0) return json
+        textCap = when {
+            textCap > 2048 -> 2048
+            textCap > 256 -> 256
+            else -> 0
+        }
+    }
+}
+
+/**
+ * 1.0.3 / D97：停止 / 异常退出工具循环时，assistant 里可能已经有 tool_use 但没有配对的
+ * tool_result，下一轮请求会 400「工具结果未配对」。给所有没配对的 tool_use 补一条占位
+ * tool_result（作为 user 消息追加在链尾），保证历史结构合法。
+ */
+private fun repairDanglingToolUses(chain: List<JSONObject>, placeholder: String): List<JSONObject> {
+    if (chain.isEmpty()) return chain
+    val useIds = LinkedHashSet<String>()
+    val resultIds = HashSet<String>()
+    for (msg in chain) {
+        val content = msg.optJSONArray("content") ?: continue
+        for (i in 0 until content.length()) {
+            val block = content.optJSONObject(i) ?: continue
+            when (block.optString("type")) {
+                "tool_use" -> block.optString("id").takeIf { it.isNotBlank() }?.let { useIds.add(it) }
+                "tool_result" -> block.optString("tool_use_id").takeIf { it.isNotBlank() }?.let { resultIds.add(it) }
+            }
+        }
+    }
+    val missing = useIds.filterNot { it in resultIds }
+    if (missing.isEmpty()) return chain
+    val results = JSONArray()
+    missing.forEach { id ->
+        results.put(
+            JSONObject()
+                .put("type", "tool_result")
+                .put("tool_use_id", id)
+                .put("content", placeholder)
+                .put("is_error", true)
+        )
+    }
+    return chain + JSONObject().put("role", "user").put("content", results)
 }
 
 /**
