@@ -31,8 +31,9 @@ object UserToolCreateTool {
           "requirements":{"type":"array","items":{"type":"string"},"description":"可选：pip 依赖包名列表（创建时只记录，安装走工具编辑页）"},
           "min_mode":{"type":"string","enum":["read_only","workspace_write","full"],"description":"最低权限档位，默认 workspace_write"},
           "enabled":{"type":"boolean","description":"创建后是否立即启用，默认 true"},
-          "ui_mode":{"type":"string","enum":["data","schema"],"description":"界面模式：data=工具返回的 JSON 由 App 自动渲染（默认）；schema=用 ui 参数声明静态视图页"},
-          "ui":{"type":"string","description":"UI Schema v2 JSON 字符串（ui_mode=schema 时必填）。可传 {\"version\":2,\"title\":\"...\",\"data\":{...},\"blocks\":[...]}，也可只传 blocks 数组"}
+          "ui_mode":{"type":"string","enum":["data","schema","pages"],"description":"界面模式：data=自动渲染；schema=v2 单页；pages=v3 多页原生界面"},
+          "ui":{"type":"string","description":"UI Schema JSON（v2: ui_mode=schema 时必填；v3: ui_mode=pages 时可传页面 JSON，body 缺省会生成占位）。v3 速查：version=3，body.type=column/row/stack/scroll/grid/text/button/image/divider/progress/badge/input/toggle/slider/card，最小示例 {\"version\":3,\"body\":{\"type\":\"column\",\"children\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"},
+          "ui_entry":{"type":"string","description":"v3 入口页名（ui_mode=pages 时必填，1-32 位小写字母/数字/下划线）"}
         },"required":["name","description","code"],"additionalProperties":false}
     """.trimIndent()
 
@@ -98,13 +99,18 @@ object UserToolCreateTool {
             }
         }
 
-        // UI Schema v2：可选。schema 模式要求 ui 是合法 JSON（对象或 blocks 数组）
+        // UI Schema：data / v2 schema / v3 pages
         val uiMode = args.optString("ui_mode").trim().lowercase().ifBlank { "data" }
-        if (uiMode !in setOf("data", "schema")) {
-            return fail("INVALID_UI", "ui_mode 只能是 data 或 schema")
+        if (uiMode !in setOf("data", "schema", "pages")) {
+            return fail("INVALID_UI", "ui_mode 只能是 data、schema 或 pages")
+        }
+        val uiEntry = args.optString("ui_entry").trim()
+        if (uiMode == "pages" && !com.dchat.app.ui.tools.UiV3Model.isPageName(uiEntry)) {
+            return fail("INVALID_UI", "ui_mode=pages 时必须提供合法的 ui_entry（1-32 位小写字母/数字/下划线）")
         }
         val uiRaw = args.optString("ui").trim()
         var uiSpec: JSONObject? = null
+        var pageSpec: JSONObject? = null
         if (uiMode == "schema") {
             if (uiRaw.isBlank()) return fail("INVALID_UI", "ui_mode=schema 时必须提供 ui（UI Schema v2 JSON）")
             uiSpec = runCatching {
@@ -120,6 +126,23 @@ object UserToolCreateTool {
             if (blocks == null || blocks.length() == 0) {
                 return fail("INVALID_UI", "ui.blocks 不能为空")
             }
+        }
+        if (uiMode == "pages") {
+            pageSpec = runCatching {
+                if (uiRaw.startsWith("{")) JSONObject(uiRaw) else null
+            }.getOrNull() ?: JSONObject()
+            pageSpec!!.put("version", 3)
+            if (pageSpec!!.optJSONObject("body") == null) {
+                pageSpec!!.put(
+                    "body",
+                    JSONObject().put("type", "column").put(
+                        "children", JSONArray().put(JSONObject().put("type", "text").put("text", "页面已创建"))
+                    )
+                )
+            }
+            if (pageSpec!!.optString("title").isBlank()) pageSpec!!.put("title", name)
+            val v = com.dchat.app.ui.tools.UiV3Model.validatePage(pageSpec!!)
+            if (!v.ok) return fail("INVALID_UI", "v3 页面校验失败：" + v.errors.joinToString("; "))
         }
 
         val existing = ToolRegistry.all().firstOrNull { it.id == UserToolStore.idForName(name) }
@@ -146,6 +169,32 @@ object UserToolCreateTool {
                 "SAVE_FAILED",
                 "创建失败：名称可能已被占用、描述/代码为空，或写盘失败（同名工具已存在时会被覆盖）"
             )
+
+        if (uiMode == "pages" && pageSpec != null) {
+            val written = runCatching {
+                val manifest = JSONObject()
+                    .put("version", 3)
+                    .put("entry", uiEntry)
+                    .put("title", name)
+                    .put(
+                        "tab",
+                        JSONArray().put(
+                            JSONObject().put("page", uiEntry).put("text", name).put("icon", "star")
+                        )
+                    )
+                val mv = com.dchat.app.ui.tools.UiV3Store.writeManifest(context, saved.id, manifest)
+                if (!mv.ok) error(mv.errors.joinToString("; "))
+                val pv = com.dchat.app.ui.tools.UiV3Store.writePage(
+                    context, saved.id, uiEntry, pageSpec.toString()
+                )
+                if (!pv.ok) error(pv.errors.joinToString("; "))
+                true
+            }.getOrDefault(false)
+            if (!written) {
+                runCatching { UserToolStore.delete(context, saved.id) }
+                return fail("SAVE_FAILED_UI", "工具已创建但 v3 页面写入失败，已回滚删除；请检查页面 JSON 后重试")
+            }
+        }
 
         // schema 模式下把视图写进 ui.json（原子写；失败则把工具回滚删掉，避免留下打不开的页面）
         if (uiMode == "schema" && uiSpec != null) {

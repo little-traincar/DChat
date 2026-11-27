@@ -125,7 +125,12 @@ class MainActivity : ComponentActivity() {
                             onOpenUsage = { stack.add(Screen.Usage) },
                             onOpenBgTasks = { stack.add(Screen.BgTasks) },
                             onOpenSchedule = { stack.add(Screen.Schedule) },
-                            onOpenFiles = openFiles
+                            onOpenFiles = openFiles,
+                            // 工具 UI v3：工具结果卡「打开」→ 全屏工具页（版本分发在 ToolUiScreen 内）
+                            onOpenToolUi = { toolId ->
+                                toolUiTarget = toolId
+                                stack.add(Screen.ToolUi)
+                            }
                         )
 
                         Screen.BgTasks -> BgTaskScreen(
@@ -162,6 +167,8 @@ class MainActivity : ComponentActivity() {
 
                         Screen.ToolUi -> ToolUiScreen(
                             toolId = toolUiTarget.orEmpty(),
+                            // v3 的 workspace: 图片按当前会话工作区解析
+                            conversationId = app.currentId,
                             onBack = { if (stack.isNotEmpty()) stack.removeAt(stack.lastIndex) }
                         )
 

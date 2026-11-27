@@ -184,6 +184,8 @@ import com.dchat.app.ui.lang.money
 import com.dchat.app.ui.theme.LocalColors
 import com.dchat.app.ui.theme.brandGradient
 import com.dchat.app.ui.theme.defaultWall
+import com.dchat.app.ui.tools.UiSpecStore
+import com.dchat.app.ui.tools.UiV3Store
 import com.dchat.app.ui.voice.AsrEngine
 import com.dchat.app.ui.voice.AsrStatus
 import com.dchat.app.ui.voice.TtsEngine
@@ -212,6 +214,8 @@ fun ChatScreen(
     onOpenBgTasks: () -> Unit = {},
     onOpenSchedule: () -> Unit = {},
     onOpenFiles: (String) -> Unit = {},
+    /** 工具结果卡「打开」：进工具页面（v3 多页 / v2 单页，版本分发在 ToolUiScreen 内） */
+    onOpenToolUi: (String) -> Unit = {},
     /** 过渡兼容：旧 MainActivity 只有无参入口 */
     onOpenSessionFiles: () -> Unit = {}
 ) {
@@ -2356,6 +2360,7 @@ onOpenImage = { imgs, index ->
                             // 1.0.3：生图占位卡显示已用时 + 卡片内「取消」（调现有 stop()）
                             generatingStartedAt = if (m.status == ChatMsg.STATUS_WIP) imageGenStartedAt else 0L,
                             onStopGenerating = if (m.status == ChatMsg.STATUS_WIP) ({ stop() }) else null,
+                            onOpenToolUi = onOpenToolUi,
                         )
                     }
                 }
@@ -2831,6 +2836,8 @@ private fun MessageRow(
     onCopy: () -> Unit,
     onSpeak: () -> Unit,
     onToggleVoiceText: () -> Unit = {},
+    /** 工具结果卡「打开」入口（进工具页面） */
+    onOpenToolUi: (String) -> Unit = {},
     /** 1.0.3：生图占位卡的开始时刻（elapsedRealtime 毫秒）；0 = 不显示已用时 */
     generatingStartedAt: Long = 0L,
     /** 1.0.3：生图占位卡里的「取消」，调用现有 stop()；null = 不显示按钮 */
@@ -2898,7 +2905,8 @@ VoiceMessageBubble(
                         durationMs = voiceDurationMs,
                         failed = voiceFailed,
                         onClick = onVoiceClick,
-                        onToggleText = onToggleVoiceText
+                        onToggleText = onToggleVoiceText,
+                        onOpenToolUi = onOpenToolUi
                     )
                 } else {
                     if (m.steps.isNotEmpty()) {
@@ -2914,7 +2922,8 @@ VoiceMessageBubble(
                                 m.status == ChatMsg.STATUS_WIP,
                                 onOpenImage,
                                 generatingStartedAt = generatingStartedAt,
-                                onStopGenerating = onStopGenerating
+                                onStopGenerating = onStopGenerating,
+                                onOpenToolUi = onOpenToolUi
                             )
                         }
                     } else {
@@ -3185,7 +3194,8 @@ private fun VoiceMessageBubble(
     durationMs: Int,
     failed: Boolean,
     onClick: () -> Unit,
-    onToggleText: () -> Unit = {}
+    onToggleText: () -> Unit = {},
+    onOpenToolUi: (String) -> Unit = {}
 ) {
     val c = LocalColors.current
     val L = LocalStrings.current
@@ -3265,7 +3275,11 @@ private fun VoiceMessageBubble(
                     .padding(horizontal = 12.dp, vertical = 10.dp)
             ) {
                 if (m.steps.isNotEmpty()) {
-                    StepTimeline(m.steps, m.status == ChatMsg.STATUS_WIP)
+                    StepTimeline(
+                        m.steps,
+                        m.status == ChatMsg.STATUS_WIP,
+                        onOpenToolUi = onOpenToolUi
+                    )
                 } else {
                     MarkdownText(
                         m.text,
@@ -3301,6 +3315,20 @@ private fun VoiceWave(progress: Float, active: Boolean) {
 
 /* ---------------- 步骤时间---------------- */
 
+/** 工具结果卡「打开」判定缓存：只缓存「有 UI」的正结果（避免重复读盘）；负结果每次卡片重新探测，兼容会话中途补写 UI */
+private val toolUiAvailability = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+/**
+ * 工具结果卡是否显示「打开」：必须是用户工具，且已有合法 v3 `ui/manifest.json` 或 v2 `ui.json`。
+ * 会读盘，调用方放 IO 线程（见 [toolUiAvailability]）。
+ */
+private fun userToolHasUi(ctx: android.content.Context, toolId: String): Boolean {
+    if (!toolId.startsWith("user.")) return false
+    if (UserToolStore.find(ctx, toolId) == null) return false
+    if (UiV3Store.readManifest(ctx, toolId) != null) return true
+    return UiSpecStore.exists(ctx, toolId)
+}
+
 @Composable
 private fun StepTimeline(
     steps: List<Step>,
@@ -3309,7 +3337,9 @@ private fun StepTimeline(
     /** 1.0.3：生图占位卡开始时刻（elapsedRealtime）；0 = 不显示已用时 */
     generatingStartedAt: Long = 0L,
     /** 1.0.3：生图占位卡上的「取消」 */
-    onStopGenerating: (() -> Unit)? = null
+    onStopGenerating: (() -> Unit)? = null,
+    /** 工具结果卡「打开」：进该工具的 UI 页面（v3 多页 / v2 单页） */
+    onOpenToolUi: (String) -> Unit = {}
 ) {
     val c = LocalColors.current
     val L = LocalStrings.current
@@ -3392,6 +3422,33 @@ private fun StepTimeline(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(8.dp))
                                     .clickable { outputPreviewFile = fullFile }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                    // v3/v2 UI 入口：仅用户工具且已有合法 ui/manifest.json 或 ui.json 时显示（读盘走 IO + 进程内缓存）
+                    if (st.toolId.startsWith("user.")) {
+                        val toolCtx = LocalContext.current
+                        var uiOpenable by remember(st.toolId) {
+                            mutableStateOf(toolUiAvailability[st.toolId])
+                        }
+                        LaunchedEffect(st.toolId) {
+                            if (uiOpenable == null) {
+                                val available = withContext(Dispatchers.IO) {
+                                    userToolHasUi(toolCtx, st.toolId)
+                                }
+                                if (available) toolUiAvailability[st.toolId] = true
+                                uiOpenable = available
+                            }
+                        }
+                        if (uiOpenable == true) {
+                            Text(
+                                L.tools.openTool,
+                                fontSize = 11.sp,
+                                color = c.brand,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { onOpenToolUi(st.toolId) }
                                     .padding(horizontal = 8.dp, vertical = 4.dp)
                             )
                         }

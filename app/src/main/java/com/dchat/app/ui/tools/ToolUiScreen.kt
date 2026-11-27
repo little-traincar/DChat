@@ -61,19 +61,20 @@ private const val PAGE_STATE = "page"
 private const val DEFAULT_TIMEOUT_MS = 5_000
 
 /**
- * 用户工具独立全屏页面（UI Schema v2）。
+ * 用户工具独立全屏页面（UI Schema v2/v3）。
  *
- * 打开顺序：
- * 1. 有合法 `ui.json` → **立即静态渲染**（`ui.json.data ∪ state/page.json`），随后后台跑 `load`；
- * 2. 没有 `ui.json` → 走旧工具链路 `open`，成功后把返回的 UI 树包成 `legacy` 块写盘，
+ * 打开顺序（规范 `docs/spec/tool-ui-v3.md` §0）：
+ * 1. 存在且校验通过的 `ui/manifest.json` → **v3 多页宿主** [UiV3Host]；
+ * 2. 否则有合法 `ui.json` → v2：**立即静态渲染**（`ui.json.data ∪ state/page.json`），随后后台跑 `load`；
+ * 3. 都没有 → 走旧工具链路 `open`，成功后把返回的 UI 树包成 `legacy` 块写盘，
  *    下次打开就走静态路径，不再执行 `open`；
- * 3. `load` 失败只显示「数据可能已过期」，页面不白屏、不暂停工具；`action` 失败只提示该动作。
+ * 4. v2 `load` 失败只显示「数据可能已过期」，页面不白屏、不暂停工具；`action` 失败只提示该动作。
  *
  * 动作/加载串行化：同一个工具的 Python 调用用 Mutex 排队，避免 `entry_preview.py`
  * 临时文件并发写入互相覆盖。
  */
 @Composable
-fun ToolUiScreen(toolId: String, onBack: () -> Unit) {
+fun ToolUiScreen(toolId: String, onBack: () -> Unit, conversationId: String? = null) {
     val c = LocalColors.current
     val L = LocalStrings.current
     val ctx = LocalContext.current
@@ -89,6 +90,11 @@ fun ToolUiScreen(toolId: String, onBack: () -> Unit) {
         else -> ToolRegistry.CONV_WORKSPACE
     }
     val pyMutex = remember(toolId) { Mutex() }
+
+    /** v3 manifest（合法且有 ui/manifest.json 时非空 → 走 UiV3Host） */
+    var uiManifest by remember(toolId) { mutableStateOf<UiManifest?>(null) }
+    /** 版本探测是否完成：未完成时只显示加载，避免先闪一下 v2 顶栏再切 v3 */
+    var modeChecked by remember(toolId) { mutableStateOf(false) }
 
     var uiSpec by remember(toolId) { mutableStateOf<JSONObject?>(null) }
     var data by remember(toolId) { mutableStateOf(JSONObject()) }
@@ -383,6 +389,16 @@ fun ToolUiScreen(toolId: String, onBack: () -> Unit) {
         if (d == null) {
             loading = false
             fatalError = "TOOL_NOT_FOUND: $toolId"
+            modeChecked = true
+            return@LaunchedEffect
+        }
+        // v3 优先：存在且校验通过 ui/manifest.json → 多页宿主（规范 §0，不做任何 v2 初始化）
+        val manifest = withContext(Dispatchers.IO) { UiV3Store.readManifest(ctx, toolId) }
+        if (manifest != null) {
+            Log.i(TAG, "open-v3 tool=$toolId entry=${manifest.entry} tabs=${manifest.tab.size}")
+            uiManifest = manifest
+            loading = false
+            modeChecked = true
             return@LaunchedEffect
         }
         val saved = withContext(Dispatchers.IO) {
@@ -409,6 +425,35 @@ fun ToolUiScreen(toolId: String, onBack: () -> Unit) {
             }
             openLegacy(d, saved, initial = true)
         }
+        modeChecked = true
+    }
+
+    // ---- 版本分发：v3 → 多页宿主；探测中只显示加载；否则走下面的 v2/legacy 原逻辑 ----
+    val v3Manifest = uiManifest
+    if (v3Manifest != null) {
+        UiV3Host(
+            toolId = toolId,
+            code = def?.code.orEmpty(),
+            conversationMode = convMode,
+            conversationId = conversationId,
+            manifest = v3Manifest,
+            fallbackTitle = fallbackTitle,
+            onExit = onBack
+        )
+        return
+    }
+    if (!modeChecked) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(c.bg)
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(L.tools.uiWorking, fontSize = 12.sp, color = c.text3)
+        }
+        return
     }
 
     val screenTitle = uiSpec?.optString("title").orEmpty().ifBlank { fallbackTitle }

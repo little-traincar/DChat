@@ -73,6 +73,7 @@ object ToolRegistry {
     private const val ID_LOCAL_WEB_SEARCH = "local.web_search"
     private const val ID_LOCAL_WEB_FETCH = "local.web_fetch"
     private const val ID_LOCAL_TOOL_LIST = "local.tool_list"
+    private const val ID_UI_WRITE = "local.ui_write"
     private const val ID_IMAGEGEN = "local.imagegen"
     /** 第五期：模型自建用户工具（写 entry.py + tool.json 并注册） */
     private const val ID_TOOL_CREATE = "local.tool_create"
@@ -90,6 +91,27 @@ object ToolRegistry {
     private const val ID_SCHEDULE_CREATE = "schedule.create"
     private const val ID_SCHEDULE_LIST = "schedule.list"
     private const val ID_SCHEDULE_CANCEL = "schedule.cancel"
+
+    /**
+     * 模型侧的「工具 UI v3 速查」。内置在 tool_create / ui_write 的 description 里，
+     * 否则模型不知道 pages 模式和页面 JSON 写法（会按 v2 的 load/action 猜错）。
+     * 保持精简：只写字段名与最小示例，完整规范在 docs/spec/tool-ui-v3.md。
+     */
+    private val UI_V3_GUIDE = """
+【工具 UI v3（多页原生界面）速查】
+目录：tools/user.<name>/ui/manifest.json + ui/pages/<page>.json + ui/assets/。
+创建多页工具：local.tool_create 传 ui_mode="pages"、ui_entry="home"；再用 local.ui_write（参数 tool_id/page/json）逐个写页面。
+manifest.json：{"version":3,"entry":"home","title":"标题","tab":[{"page":"home","text":"首页"},{"page":"settings","text":"设置"}]}（tab 可选，3-5 项才显示底部栏）。
+页面 JSON：{"version":3,"title":"页标题","theme":{"colorPrimary":"#4D6BFE","radius":14},"background":{...},"body":{...}}。
+  background：{"type":"color","value":"#101A33"} 或 {"type":"gradient","stops":[["#101A33",0],["#4B5FA8",1]],"angle":180} 或 {"type":"image","src":"assets/bg.jpg","fit":"cover","blur":8,"scrim":0.45}。
+  body 节点：{"type":"column","padding":16,"gap":12,"children":[...]}；布局 column/row/stack/scroll/grid/spacer。
+  组件：text{text,size,color,weight} / button{text,action,params,style:filled|outline|ghost} / image{src,height,fit,radius} / icon{name} / divider / progress{value} / badge{text,color} / card{...children} / input{key,placeholder,text,action} / toggle{key,value,action} / slider{key,min,max,step,value,action}。
+  绑定：字符串里 {{state.city}} 取状态值；actions 用 "action":"refresh" + 可选 "params":{...}。
+entry.py 事件（不要再写 v2 的 load/action，v3 页面用下面两个）：
+  def page_load(page, args, state) -> dict：返回 {"state": {...}} 初始化页面状态。
+  def page_action(page, action, params, state) -> dict：返回 {"state":{...}} 合并状态、{"navigate":"settings"} 跳页、{"back":True} 返回、{"toast":"已保存"}。
+示例：page_load("home", {}, {}) 返回 {"state":{"city":"广州","temp":16}}，页面 text 写 "{{state.city}} {{state.temp}}°"。
+""".trimIndent()
 
     // ---- 旧 prefs 字段（一次性迁移 + 镜像回写用）----
     private const val PREF_TOOL_SEARCH = "toolSearch"
@@ -629,7 +651,7 @@ object ToolRegistry {
                 + "需要工具带 UI 页面时，传 ui_mode=schema 并用 ui 给出 UI Schema v2，例如："
                 + "{\"version\":2,\"title\":\"天气\",\"data\":{\"city\":\"上海\",\"temp\":\"26°C\"},\"blocks\":[{\"type\":\"card\",\"children\":[{\"type\":\"keyvalue\",\"value\":{\"城市\":\"{{city}}\",\"气温\":\"{{temp}}\"}}]}]}；"
                 + "可用节点：column/row/card/group/scroll、text/markdown/image/badge/progress/keyvalue/spacer/divider、input/textarea/toggle/select/slider/date/button、list、bar/line/pie；"
-                + "字符串里的 {{key}} 会用 data[key] 替换。entry.py 可选实现 def load(args, state) 返回数据 dict、def action(name, args, data, state) 处理按钮动作。",
+                + "字符串里的 {{key}} 会用 data[key] 替换。entry.py 可选实现 def load(args, state) 返回数据 dict、def action(name, args, data, state) 处理按钮动作。" + UI_V3_GUIDE,
             needs = emptySet(),
             minMode = ToolMode.WORKSPACE_WRITE,
             timeoutMs = 20_000,
@@ -639,6 +661,15 @@ object ToolRegistry {
             paramsSchema = UserToolCreateTool.SCHEMA
         ),
         // ---- 4c：文件工具（fs.*） ----
+        localTool(
+            ID_UI_WRITE, "ui_write",
+            "写/改用户工具的 UI v3 页面。页面 JSON 最小示例：{\"version\":3,\"body\":{\"type\":\"column\",\"children\":[{\"type\":\"text\",\"text\":\"hi\"}]}}；布局 column/row/stack/scroll/grid/spacer，组件 text/button/image/icon/divider/progress/badge/input/toggle/slider/card；绑定只支持 {{state.path}}。" + UI_V3_GUIDE,
+            needs = emptySet(),
+            minMode = ToolMode.WORKSPACE_WRITE,
+            timeoutMs = 10_000,
+            enabled = true,
+            paramsSchema = """{"type":"object","properties":{"tool_id":{"type":"string"},"page":{"type":"string"},"json":{"type":"string"},"create_tab":{"type":"array"}},"required":["tool_id","page","json"],"additionalProperties":false}"""
+        ),
         localTool(
             ID_LOCAL_WEB_SEARCH, "web_search",
             "联网检索实时信息；参数 query/count/need_content，返回标题、链接、摘要。",

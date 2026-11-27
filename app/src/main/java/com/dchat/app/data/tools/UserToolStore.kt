@@ -281,7 +281,7 @@ object UserToolStore {
     }.getOrDefault(false)
 
     private fun normalizeUiMode(raw: String): String =
-        if (raw == "schema") "schema" else "data"
+        if (raw == "schema" || raw == "pages") raw else "data"
 
     private fun writeAtomic(target: File, text: String) {
         target.parentFile?.mkdirs()
