@@ -180,7 +180,11 @@ internal fun chatZh(): ChatStr = ChatStr(
     sizeUnknown = "大小未知",
     pythonOutputSaved = "完整输出已保存到 %s（共 %s），需要时可先用 fs.read 读取前若干行",
     pythonFullOutput = "完整输出：%s（%s）",
-    previewTruncated = "（仅显示前 %s，完整内容在会话文件里）"
+    previewTruncated = "（仅显示前 %s，完整内容在会话文件里）",
+    userTools = "工具",
+    userToolsEmpty = "还没有工具，让模型创建一个",
+    userToolsWeb = "网页",
+    userToolsData = "数据"
 )
 
 internal fun settingsZh(): SettingsStr = SettingsStr(

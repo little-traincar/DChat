@@ -180,7 +180,11 @@ internal fun chatKo(): ChatStr = ChatStr(
     sizeUnknown = "크기 알 수 없음",
     pythonOutputSaved = "전체 출력이 %s에 저장되었습니다(%s). 필요하면 fs.read로 앞부분을 읽을 수 있습니다.",
     pythonFullOutput = "전체 출력: %s(%s)",
-    previewTruncated = "(앞부분 %s만 표시되며, 전체 내용은 대화 파일에 있습니다)"
+    previewTruncated = "(앞부분 %s만 표시되며, 전체 내용은 대화 파일에 있습니다)",
+    userTools = "도구",
+    userToolsEmpty = "아직 도구가 없습니다. 모델에게 만들어 달라고 하세요",
+    userToolsWeb = "웹",
+    userToolsData = "데이터"
 )
 
 internal fun settingsKo(): SettingsStr = SettingsStr(

@@ -1,15 +1,22 @@
 package com.dchat.app.ui.tools
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import com.dchat.app.data.droid.DroidHost
 import com.dchat.app.data.tools.PyResult
 import com.dchat.app.data.tools.PyRuntime
 import com.dchat.app.data.tools.ToolRegistry
 import com.dchat.app.data.tools.UserToolStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -43,8 +50,12 @@ class ToolWebBridge(
     private val conversationId: String?,
     /** 会话权限档位：read / workspace / full（沿用 Conversation.PERMISSION_*） */
     private val permission: String,
+    /** 宿主提供当前 WebView（异步结果用 evaluateJavascript 回传；页面销毁后返回 null） */
+    private val webViewProvider: () -> WebView?,
     /** 退出工具页（宿主保证切主线程） */
-    private val onClose: () -> Unit
+    private val onClose: () -> Unit,
+    /** 首次 run/runAsync 完成时回调一次（宿主用于 “web open: firstRun=…ms” 计时，默认忽略） */
+    private val onFirstRun: () -> Unit = {}
 ) {
 
     /** 同一页面内的 Python 调用串行（JS 本身单线程，这里防重入/桥线程并发） */
@@ -56,10 +67,33 @@ class ToolWebBridge(
     @Volatile
     private var closed = false
 
-    /** 页面关闭时由宿主调用：标记关闭并取消进行中的 `run` 调用 */
+    /** 异步 run 的协程作用域：每个页面一个，页面销毁时取消 pending job */
+    private val asyncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** cbId → 正在跑的 runAsync job（页面关闭时逐个取消并回 CANCELLED） */
+    private val pendingAsync: MutableMap<String, Job> =
+        java.util.Collections.synchronizedMap(LinkedHashMap<String, Job>())
+
+    /** 每个 cbId 只回调一次（自然完成 / 关闭取消 二选一） */
+    private val asyncDelivered: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val firstRunDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 页面关闭时由宿主调用：标记关闭、取消进行中的 run/runAsync 并各回一次 CANCELLED */
     fun cancelInFlight() {
         closed = true
         runCatching { activeRunJob?.cancel() }
+        val pending: List<Pair<String, Job>> = synchronized(pendingAsync) {
+            val list = pendingAsync.entries.map { it.key to it.value }
+            pendingAsync.clear()
+            list
+        }
+        for ((cbId, job) in pending) {
+            deliverAsync(cbId, errorJson("CANCELLED", "工具页已关闭"))
+            runCatching { job.cancel() }
+        }
     }
 
     /** 同步调用 droid 能力，返回 JSON 字符串；任何异常都转成错误 JSON，不向 JS 抛。 */
@@ -78,60 +112,149 @@ class ToolWebBridge(
     }
 
     /**
-     * 执行当前工具 `entry.py` 里的顶层函数（`func` 缺省 `run`），走现有 Python 执行链。
+     * 同步版 `run`（兼容旧页面）：在 JS 的 JavaBridge 线程上阻塞，直到结果返回。
      *
-     * 返回 `{"ok":true,"result":"<字符串>"}`（函数返回 dict/list 时 runner 会先 JSON 序列化）；
-     * 失败 `{"ok":false,"code":"TOOL_TIMEOUT|TOOL_ERROR|PERMISSION_DENIED|PY_UNAVAILABLE|CANCELLED","error":...}`。
-     *
-     * 注意：在 JS 的 JavaBridge 线程上 **同步阻塞**（页面自己显示 loading）；结果上限 4MB。
-     * 任何异常都不会抛给 JS 线程（最外层兜底 DROID_ERROR/TOOL_ERROR JSON）。
+     * 返回 `{"ok":true,"result":"<字符串>"}`；失败
+     * `{"ok":false,"code":"TOOL_TIMEOUT|TOOL_ERROR|PERMISSION_DENIED|PY_UNAVAILABLE|CANCELLED","error":...}`。
+     * 新页面建议用 [runAsync]（不阻塞 JS）。
      */
     @JavascriptInterface
-    fun run(func: String, argsJson: String): String = try {
-        runInternal(func, argsJson)
-    } catch (c: CancellationException) {
-        errorJson("CANCELLED", "调用已取消")
-    } catch (t: Throwable) {
-        Log.w(TAG, "python run failed (tool=$toolId func=$func)", t)
-        errorJson("TOOL_ERROR", t.message ?: t.javaClass.simpleName)
+    fun run(func: String, argsJson: String): String {
+        val out = try {
+            runBlocking {
+                activeRunJob = kotlinx.coroutines.currentCoroutineContext()[Job]
+                try {
+                    when (val prep = prepareRun(func, argsJson)) {
+                        is RunSlot.Err -> prep.json
+                        is RunSlot.Ok -> executeRun(prep)
+                    }
+                } finally {
+                    activeRunJob = null
+                }
+            }
+        } catch (c: CancellationException) {
+            errorJson("CANCELLED", "调用已取消")
+        } catch (t: Throwable) {
+            Log.w(TAG, "python run failed (tool=$toolId func=$func)", t)
+            errorJson("TOOL_ERROR", t.message ?: t.javaClass.simpleName)
+        }
+        onFirstRunOnce()
+        return out
     }
 
-    private fun runInternal(func: String, argsJson: String): String {
+    /**
+     * 异步版 `run`：**立即返回**，后台线程（IO 协程）执行本工具 entry.py；
+     * 完成后主线程调用页面回调：
+     *
+     * ```js
+     * window.__dchatRunResult && window.__dchatRunResult(cbId, {ok:true,result:"..."});
+     * ```
+     *
+     * 同一页面内与同步 `run` 共用 [runMutex] 串行；页面关闭/取消时对每个未完成 cbId
+     * 回调一次 `{"ok":false,"code":"CANCELLED"}`（已在 `deliverAsync` 里按 cbId 去重）。
+     */
+    @JavascriptInterface
+    fun runAsync(func: String, argsJson: String, cbId: String) {
+        if (closed) {
+            deliverAsync(cbId, errorJson("CANCELLED", "工具页已关闭"))
+            return
+        }
+        val job = asyncScope.launch {
+            val result = try {
+                when (val prep = prepareRun(func, argsJson)) {
+                    is RunSlot.Err -> prep.json
+                    is RunSlot.Ok -> executeRun(prep)
+                }
+            } catch (c: CancellationException) {
+                errorJson("CANCELLED", "调用已取消")
+            } catch (t: Throwable) {
+                Log.w(TAG, "python runAsync failed (tool=$toolId func=$func)", t)
+                errorJson("TOOL_ERROR", t.message ?: t.javaClass.simpleName)
+            }
+            // 页面已关闭：统一回 CANCELLED（自然完成但关闭竞态时也只回调一次）
+            deliverAsync(cbId, if (closed) errorJson("CANCELLED", "工具页已关闭") else result)
+        }
+        pendingAsync[cbId] = job
+        job.invokeOnCompletion {
+            pendingAsync.remove(cbId)
+            onFirstRunOnce()
+        }
+    }
+
+    /** 参数/权限校验（同步/异步共用）；错误时直接给结构化 JSON，避免后面再判断 */
+    private sealed class RunSlot {
+        class Err(val json: String) : RunSlot()
+        class Ok(
+            val name: String,
+            val mode: String,
+            val convId: String,
+            val timeoutMs: Int,
+            val code: String,
+            val argsJson: String
+        ) : RunSlot()
+    }
+
+    private fun prepareRun(func: String, argsJson: String): RunSlot {
         val name = func.trim().ifBlank { "run" }
         if (!FUNC_NAME.matches(name)) {
-            return errorJson("TOOL_ERROR", "函数名不合法：$name")
+            return RunSlot.Err(errorJson("TOOL_ERROR", "函数名不合法：$name"))
         }
-        if (closed) return errorJson("CANCELLED", "工具页已关闭")
+        if (closed) return RunSlot.Err(errorJson("CANCELLED", "工具页已关闭"))
         val def = UserToolStore.find(appContext, toolId)
-            ?: return errorJson("TOOL_ERROR", "工具不存在或已被删除：$toolId")
+            ?: return RunSlot.Err(errorJson("TOOL_ERROR", "工具不存在或已被删除：$toolId"))
         val mode = effectivePermission()
         if (!runCatching { ToolRegistry.canExecute(toolId, mode) }.getOrDefault(false)) {
-            return errorJson("PERMISSION_DENIED", "当前会话权限不足以执行该工具（$mode）")
+            return RunSlot.Err(errorJson("PERMISSION_DENIED", "当前会话权限不足以执行该工具（$mode）"))
         }
         val convId = conversationId?.takeIf { it.isNotBlank() } ?: "web"
         val timeoutMs = runCatching { ToolRegistry.byId(toolId)?.timeoutMs }.getOrNull() ?: 30_000
-        return runBlocking {
-            activeRunJob = kotlinx.coroutines.currentCoroutineContext()[Job]
-            try {
-                runMutex.withLock {
-                    if (closed) {
-                        return@runBlocking errorJson("CANCELLED", "工具页已关闭")
-                    }
-                    val r = PyRuntime.runCode(
-                        context = appContext,
-                        toolId = toolId,
-                        entryFunction = name,
-                        code = def.code,
-                        argsJson = argsJson.ifBlank { "{}" },
-                        conversationId = convId,
-                        timeoutMs = timeoutMs,
-                        conversationMode = mode
-                    )
-                    formatRunResult(r)
-                }
-            } finally {
-                activeRunJob = null
+        return RunSlot.Ok(name, mode, convId, timeoutMs, def.code, argsJson.ifBlank { "{}" })
+    }
+
+    /** 真正执行 Python（挂起，可被取消）；调用方负责串行 Mutex */
+    private suspend fun executeRun(prep: RunSlot.Ok): String = runMutex.withLock {
+        if (closed) {
+            errorJson("CANCELLED", "工具页已关闭")
+        } else {
+            val r = PyRuntime.runCode(
+                context = appContext,
+                toolId = toolId,
+                entryFunction = prep.name,
+                code = prep.code,
+                argsJson = prep.argsJson,
+                conversationId = prep.convId,
+                timeoutMs = prep.timeoutMs,
+                conversationMode = prep.mode
+            )
+            formatRunResult(r)
+        }
+    }
+
+    /** 主线程把结果回传给 JS（每个 cbId 只调一次；页面已销毁/JS 未定义则静默丢弃） */
+    private fun deliverAsync(cbId: String, resultJson: String) {
+        if (!asyncDelivered.add(cbId)) return
+        onFirstRunOnce()
+        val js = "(function(){try{var f=window.__dchatRunResult;if(typeof f==='function'){f(" +
+            JSONObject.quote(cbId) + "," + resultJson + ");}}catch(e){}})();"
+        val deliver: () -> Unit = {
+            val wv = runCatching { webViewProvider() }.getOrNull()
+            if (wv != null) {
+                runCatching { wv.evaluateJavascript(js, null) }
+                    .onFailure { Log.w(TAG, "evaluateJavascript failed cb=$cbId", it) }
             }
+        }
+        // 已在主线程（页面关闭取消路径）就直接投递，保证 destroy 之前把 CANCELLED 交给页面；
+        // 后台完成路径统一 post 到主线程。
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            deliver()
+        } else {
+            mainHandler.post { deliver() }
+        }
+    }
+
+    private fun onFirstRunOnce() {
+        if (firstRunDone.compareAndSet(false, true)) {
+            runCatching { onFirstRun() }
         }
     }
 

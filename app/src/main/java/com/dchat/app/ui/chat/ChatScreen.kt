@@ -90,6 +90,7 @@ import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Public
@@ -239,6 +240,8 @@ val toolSpecs = ToolRegistry.tools
     var drawer by remember { mutableStateOf(false) }
     var sheet by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    // 「⋮ → 工具」弹层：直接打开用户工具，不用每次进设置
+    var userToolsSheet by remember { mutableStateOf(false) }
     // 顶栏盾牌：本会话权限浮层
     var permMenu by remember { mutableStateOf(false) }
     // 抽屉行「⋯」菜单选中的目标会话：重命名/删除都作用于它，不一定是当前会话
@@ -2501,9 +2504,23 @@ if (menu) {
                     val cid = app.currentId
                     if (cid != null) onOpenFiles(cid)
                     onOpenSessionFiles()
+                },
+                onOpenUserTools = {
+                    menu = false
+                    userToolsSheet = true
                 }
             )
         }
+
+        // 「⋮ → 工具」：用户工具弹层，点一行直接打开工具页（web 模式 WebView / data 模式走 ToolUiScreen 提示）
+        UserToolsSheet(
+            visible = userToolsSheet,
+            onDismiss = { userToolsSheet = false },
+            onOpenTool = { id ->
+                userToolsSheet = false
+                onOpenToolUi(id)
+            }
+        )
 
         // 第三期：本会话权限浮层（与「⋮」同风格的布局内浮层，不用 Popup
 if (permMenu) {
@@ -4214,7 +4231,8 @@ private fun FileMenu(
     onImport: () -> Unit,
     onOpenBgTasks: () -> Unit,
     onOpenSchedule: () -> Unit,
-    onOpenSessionFiles: () -> Unit
+    onOpenSessionFiles: () -> Unit,
+    onOpenUserTools: () -> Unit
 ) {
     val c = LocalColors.current
     val L = LocalStrings.current
@@ -4248,6 +4266,8 @@ private fun FileMenu(
                     .background(c.line2)
             )
             MenuRow(L.files.title, Icons.Rounded.Folder, onClick = onOpenSessionFiles)
+            // 用户工具入口：直接打开 web 工具页（不用先进设置）
+            MenuRow(L.chat.userTools, Icons.Rounded.Widgets, onClick = onOpenUserTools)
             // 4c v2：任务管理入口（带当前会话数量；0 时置灰但可点进空态页）
             MenuRow(
                 label = L.format(L.tasks.menuCount, L.tasks.scheduleTitle, scheduleCount),

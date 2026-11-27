@@ -303,7 +303,16 @@ data class ChatStr(
     /** Python 工具卡「完整输出：文件名（大小）」：%s = 文件名，%s = 大小 */
     val pythonFullOutput: String,
     /** 文本预览截断提示：%s = 只显示的大小 */
-    val previewTruncated: String
+    val previewTruncated: String,
+    // ---- 聊天页「⋮」菜单：用户工具入口 + 工具弹层 ----
+    /** 菜单项/弹层标题 */
+    val userTools: String,
+    /** 空列表提示 */
+    val userToolsEmpty: String,
+    /** 工具卡片标签：web 模式 */
+    val userToolsWeb: String,
+    /** 工具卡片标签：data 模式 */
+    val userToolsData: String
 )
 
 /** 设置页 */

@@ -7,6 +7,7 @@ import android.content.ContextWrapper
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -57,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
+import com.dchat.app.data.tools.PyProcessRuntime
 import com.dchat.app.ui.LocalUrlOpener
 import com.dchat.app.ui.lang.LocalStrings
 import com.dchat.app.ui.theme.LocalColors
@@ -131,8 +133,41 @@ fun ToolUiScreen(
     // 页面已退出：晚到的 WebView 回调（loading/close/renderGone）直接丢弃，避免误 pop 其它页面
     val alive = remember(toolId) { booleanArrayOf(true) }
 
+    // 打开耗时埋点：[0]=createMs [1]=loadMs [2]=firstRunMs [3]=已打印(0/1)；-1 = 未发生
+    val openStart = remember(toolId) { SystemClock.elapsedRealtime() }
+    val timing = remember(toolId) { longArrayOf(-1L, -1L, -1L, 0L) }
+    val logTiming: () -> Unit = remember(toolId) {
+        {
+            if (timing[0] >= 0 && timing[1] >= 0 && timing[2] >= 0 && timing[3] == 0L) {
+                timing[3] = 1L
+                Log.i(
+                    TAG,
+                    "web open: create=${timing[0]}ms load=${timing[1]}ms firstRun=${timing[2]}ms"
+                )
+                // 真机 logcat 在部分 ROM 上看不到应用日志：同时落盘一份，方便 adb run-as 读取测速
+                runCatching {
+                    java.io.File(appContext.filesDir, "web_perf.log").appendText(
+                        "${System.currentTimeMillis()} tool=$toolId create=${timing[0]} load=${timing[1]} firstRun=${timing[2]}\n"
+                    )
+                }
+            }
+        }
+    }
+
     LaunchedEffect(toolId) {
-        pageInfo = withContext(Dispatchers.IO) { inspectToolPage(ctx, toolId) }
+        val info = withContext(Dispatchers.IO) { inspectToolPage(ctx, toolId) }
+        pageInfo = info
+        // 确定是 Web 页后立即预热 Python（non-suspend、立即返回、失败静默），缩短首次 dchat.run 等待
+        if (info?.mode == ToolPageMode.WEB) {
+            runCatching {
+                PyProcessRuntime.warm(
+                    context = appContext,
+                    toolId = toolId,
+                    conversationId = conversationId.orEmpty(),
+                    conversationMode = sessionPermission
+                )
+            }.onFailure { Log.w(TAG, "warm failed tool=$toolId", it) }
+        }
     }
 
     // 系统返回键 = 退出工具页（规范 §4：不交给 WebView 历史）
@@ -201,8 +236,29 @@ fun ToolUiScreen(
                                             }
                                         },
                                         onCloseRequest = { mainHandler.post { if (alive[0]) onBack() } },
-                                        onBridgeCreated = { wv, bridge -> bridges[wv] = bridge }
-                                    ).also { wv -> webViewHolder[0] = wv }
+                                        onBridgeCreated = { wv, bridge -> bridges[wv] = bridge },
+                                        webViewProvider = { webViewHolder[0] },
+                                        onFirstRun = {
+                                            mainHandler.post {
+                                                if (!alive[0]) return@post
+                                                timing[2] = SystemClock.elapsedRealtime() - openStart
+                                                logTiming()
+                                            }
+                                        },
+                                        onPageLoaded = {
+                                            mainHandler.post {
+                                                if (!alive[0]) return@post
+                                                if (timing[1] < 0) {
+                                                    timing[1] = SystemClock.elapsedRealtime() - openStart
+                                                    logTiming()
+                                                }
+                                            }
+                                        }
+                                    ).also { wv ->
+                                        webViewHolder[0] = wv
+                                        timing[0] = SystemClock.elapsedRealtime() - openStart
+                                        logTiming()
+                                    }
                                 },
                                 onRelease = { wv ->
                                     if (webViewHolder[0] === wv) webViewHolder[0] = null
@@ -374,7 +430,10 @@ private fun createToolWebView(
     onLoadError: (String) -> Unit,
     onRenderGone: () -> Unit,
     onCloseRequest: () -> Unit,
-    onBridgeCreated: (WebView, ToolWebBridge) -> Unit
+    onBridgeCreated: (WebView, ToolWebBridge) -> Unit,
+    webViewProvider: () -> WebView?,
+    onFirstRun: () -> Unit,
+    onPageLoaded: () -> Unit
 ): WebView {
     val wv = WebView(context)
     wv.setBackgroundColor(android.graphics.Color.TRANSPARENT)
@@ -405,7 +464,8 @@ private fun createToolWebView(
         webRoot = canonicalRoot,
         openExternal = openExternal,
         onLoadError = onLoadError,
-        onRenderGone = onRenderGone
+        onRenderGone = onRenderGone,
+        onPageLoaded = onPageLoaded
     )
     wv.webChromeClient = object : WebChromeClient() {
         override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
@@ -466,7 +526,9 @@ private fun createToolWebView(
         toolId = toolId,
         conversationId = conversationId,
         permission = permission,
-        onClose = onCloseRequest
+        webViewProvider = webViewProvider,
+        onClose = onCloseRequest,
+        onFirstRun = onFirstRun
     )
     onBridgeCreated(wv, bridge)
     wv.addJavascriptInterface(bridge, ToolWebBridge.NAME)
@@ -496,7 +558,8 @@ private class ToolWebViewClient(
     private val webRoot: File,
     private val openExternal: (String) -> Unit,
     private val onLoadError: (String) -> Unit,
-    private val onRenderGone: () -> Unit
+    private val onRenderGone: () -> Unit,
+    private val onPageLoaded: () -> Unit
 ) : WebViewClient() {
 
     /**
@@ -557,9 +620,12 @@ private class ToolWebViewClient(
         return true
     }
 
-    /** 页面加载完成：把状态栏高度注入成 CSS 变量 `--dchat-sb`（CSS px = dp），页面用它避免被状态栏图标压住 */
+    /** 页面加载完成：注入状态栏高度 CSS 变量 + 记录 “web open: load=…ms” 计时（仅主页面） */
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
+        if (url?.startsWith("https://$WEB_HOST/") == true) {
+            runCatching { onPageLoaded() }
+        }
         val ctx = view?.context ?: return
         val res = ctx.resources
         val id = res.getIdentifier("status_bar_height", "dimen", "android")

@@ -180,7 +180,11 @@ internal fun chatEn(): ChatStr = ChatStr(
     sizeUnknown = "Unknown size",
     pythonOutputSaved = "The full output was saved to %s (%s). Use fs.read to read the first lines if needed.",
     pythonFullOutput = "Full output: %s (%s)",
-    previewTruncated = "(only the first %s is shown; the full content is in the session files)"
+    previewTruncated = "(only the first %s is shown; the full content is in the session files)",
+    userTools = "Tools",
+    userToolsEmpty = "No tools yet — ask the model to create one",
+    userToolsWeb = "Web",
+    userToolsData = "Data"
 )
 
 internal fun settingsEn(): SettingsStr = SettingsStr(

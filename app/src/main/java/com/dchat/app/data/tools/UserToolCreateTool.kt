@@ -155,8 +155,13 @@ object UserToolCreateTool {
                 <!doctype html>
                 <html><head><meta charset="utf-8">
                 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-                <style>body{font-family:system-ui,sans-serif;padding:20px;background:#f5f6f8;color:#1a1a1a}</style>
-                </head><body><h2>$name</h2><p>这是一个 Web 工具页占位；模型可用 local.web_write 修改 web/index.html。</p></body></html>
+                <style>body{font-family:system-ui,sans-serif;padding:20px;background:#f5f6f8;color:#1a1a1a}#v{color:#5a5f66;font-size:14px}</style>
+                </head><body><h2>$name</h2><p id="v">加载中…</p>
+                <script>
+                window.__dchatRunResult=function(id,json){try{var r=JSON.parse(json);document.getElementById('v').textContent=(r&&r.result)||'无数据'}catch(e){document.getElementById('v').textContent='加载失败'}};
+                setTimeout(function(){var e=document.getElementById('v');if(e.textContent==='加载中…')e.textContent='加载超时'},10000);
+                try{dchat.runAsync('$entry','{}','boot')}catch(e){document.getElementById('v').textContent='加载失败'}
+                </script></body></html>
             """.trimIndent()
             val args = JSONObject()
                 .put("tool_id", saved.id)

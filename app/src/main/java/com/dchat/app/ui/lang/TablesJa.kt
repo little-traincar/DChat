@@ -180,7 +180,11 @@ internal fun chatJa(): ChatStr = ChatStr(
     sizeUnknown = "サイズ不明",
     pythonOutputSaved = "完全な出力は %s に保存されました（%s）。必要なら fs.read で先頭から読み取れます。",
     pythonFullOutput = "完全な出力：%s（%s）",
-    previewTruncated = "（先頭 %s のみ表示。完全な内容は会話ファイルにあります）"
+    previewTruncated = "（先頭 %s のみ表示。完全な内容は会話ファイルにあります）",
+    userTools = "ツール",
+    userToolsEmpty = "ツールはまだありません。モデルに作成してもらいましょう",
+    userToolsWeb = "Web",
+    userToolsData = "データ"
 )
 
 internal fun settingsJa(): SettingsStr = SettingsStr(

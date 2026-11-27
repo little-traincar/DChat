@@ -101,7 +101,13 @@ object ToolRegistry {
 【工具 Web 界面速查】
 工具包：tools/user.<name>/web/index.html（入口）+ web/assets/（本地图片/CSS/JS）；tool.json 的 uiMode="web"。
 写法：HTML/CSS/JS 全部本地，可直接内联；禁止外链 CDN、远程字体/脚本和 fetch 外网（会被阻断）。
-window.dchat：dchat.call("device"/"toast"/"notify"/"battery"/... , jsonArgs) 同步返回 JSON 字符串；dchat.run("函数名","{...}") 调用本工具 entry.py 顶层函数，返回 {"ok":true,"result":"..."}；dchat.saveState(json)/loadState()/close()。
+window.dchat：dchat.call("device"/"toast"/"notify"/"battery"/... , jsonArgs) 同步返回 JSON 字符串；dchat.run("函数名","{...}") 调用本工具 entry.py 顶层函数，返回 {"ok":true,"result":"..."}；dchat.runAsync("函数名","{...}","cbId") 立即返回，完成后调用 window.__dchatRunResult(cbId, json)；dchat.saveState(json)/loadState()/close()。
+首屏建议：先渲染静态骨架，再 runAsync 取数，回调里更新 DOM，避免等 Python 阻塞首屏。
+示例（含回调/超时兜底）：
+window.__dchatRunResult=(id,json)=>{document.getElementById('t').textContent=JSON.parse(json).result};
+setTimeout(()=>{const e=document.getElementById('t');if(e.textContent==='加载中…')e.textContent='加载超时'},8000);
+document.getElementById('t').textContent='加载中…';
+dchat.runAsync("get_weather",'{"city":"广州"}',"boot");
 资源：图片放 web/assets/，用相对路径 assets/xxx.png；页面用 viewport-fit=cover + env(safe-area-inset-*)。
 示例：<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>body{font-family:sans-serif;padding:20px;background:#f5f6f8}</style><h2>天气</h2><button onclick="const r=dchat.run('get_weather','{\"city\":\"广州\"}');document.querySelector('#t').textContent=JSON.parse(r).result">刷新</button>
 """.trimIndent()

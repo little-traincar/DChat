@@ -17,8 +17,10 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStreamReader
 import java.util.ArrayDeque
+import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -55,6 +57,14 @@ object PyProcessRuntime {
     private const val FAILURE_COOLDOWN_MS = 60_000L
     private const val CHILD_BOOT_TIMEOUT_MS = 20_000L
 
+    // ---- 预热（工具页打开时提前拉起 CPython 子进程）----
+    /** 预热总预算：ensureBoot + 创建 Worker（超时则放弃并关闭） */
+    private const val WARM_TIMEOUT_MS = 8_000L
+    /** 同时最多 2 个工具在预热（不会占满全局 5 个进程预算） */
+    private const val WARM_MAX_PARALLEL = 2
+    /** 拿全局进程预算时最多等 1.5s，拿不到就跳过（不阻塞工具页） */
+    private const val WARM_BUDGET_WAIT_MS = 1_500L
+
     /** 单次执行内存软限：256MB（子进程 RSS 增量） */
     private const val CHILD_SOFT_MEMORY_KB = 256L * 1024
     /** 解释器总硬限：512MB（子进程 RSS 绝对值）；超限直接 kill 子进程，下次请求自动重启解释器 */
@@ -74,6 +84,15 @@ object PyProcessRuntime {
     private val lock = Any()
     private val idle = ArrayDeque<Worker>()
     private val activePool = HashSet<Worker>()
+
+    /** 预热并发上限（与请求池的 3 个 slot 独立，避免占满请求并发/全局进程预算） */
+    private val warmSemaphore = Semaphore(WARM_MAX_PARALLEL)
+    /** 单线程池的事件循环不阻塞调用方；真正并行数由 [warmSemaphore] 控制（≤2） */
+    private val warmExecutor = Executors.newFixedThreadPool(WARM_MAX_PARALLEL) { r ->
+        Thread(r, "pychild-warm").apply { isDaemon = true }
+    }
+    /** 正在预热的 toolId（幂等：同一工具重复调用直接跳过） */
+    private val warmingTools: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
 
     private var startsInWindow = 0
     private var windowStart = 0L
@@ -110,6 +129,124 @@ object PyProcessRuntime {
             failureUntil = 0
             startsInWindow = 0
             windowStart = 0
+        }
+    }
+
+    /**
+     * 预热：提前拉起 / 复用一个 CPython 子进程放进 idle 池，降低工具页首次调用延迟。
+     *
+     * - 完全异步：调用方（通常是 UI 线程）立即返回；
+     * - 幂等：同 toolId 正在预热 / 已有 idle worker / 池已满 → 直接跳过；
+     * - 资源上限：**同时最多 2 个工具预热**（[WARM_MAX_PARALLEL]），每个工具只建 1 个，
+     *   拿不到全局进程预算（[ProcBudget]）或 8s 预算超时就跳过，绝不占满 5 个进程预算；
+     * - 失败静默：只打日志，不影响工具页打开。
+     *
+     * 日志格式（便于测速）：`warm start/done/skip/timeout/fail toolId=… costMs=… reason=…`
+     */
+    fun warm(context: Context, toolId: String, conversationId: String, conversationMode: String) {
+        if (!shouldUseChild()) {
+            Log.i(TAG, "warm skip toolId=$toolId reason=child_disabled")
+            return
+        }
+        val app = context.applicationContext ?: context
+        synchronized(lock) {
+            if (toolId in warmingTools) {
+                Log.i(TAG, "warm skip toolId=$toolId reason=already_warming")
+                return
+            }
+            if (idle.any { it.isAlive }) {
+                Log.i(TAG, "warm skip toolId=$toolId reason=idle_worker_exists")
+                return
+            }
+            if (idle.size + activePool.size >= POOL_SIZE) {
+                Log.i(TAG, "warm skip toolId=$toolId reason=pool_full")
+                return
+            }
+            warmingTools.add(toolId)
+        }
+        if (!warmSemaphore.tryAcquire()) {
+            warmingTools.remove(toolId)
+            Log.i(TAG, "warm skip toolId=$toolId reason=warm_queue_full")
+            return
+        }
+        val started = SystemClock.elapsedRealtime()
+        Log.i(TAG, "warm start toolId=$toolId conversationId=$conversationId mode=$conversationMode")
+        try {
+            warmExecutor.execute { runWarm(app, toolId, started) }
+        } catch (t: Throwable) {
+            // 理论上不会走到（线程池不 shutdown）；兜底释放，绝不影响调用方
+            warmSemaphore.release()
+            warmingTools.remove(toolId)
+            Log.w(TAG, "warm fail toolId=$toolId costMs=${SystemClock.elapsedRealtime() - started} reason=enqueue", t)
+        }
+    }
+
+    private fun runWarm(app: Context, toolId: String, started: Long) {
+        var worker: Worker? = null
+        var addedToIdle = false
+        try {
+            val b = ensureBoot(app)
+            if (b == null) {
+                Log.w(TAG, "warm fail toolId=$toolId costMs=${SystemClock.elapsedRealtime() - started} reason=boot_unavailable")
+                return
+            }
+            val bootCost = SystemClock.elapsedRealtime() - started
+            if (bootCost > WARM_TIMEOUT_MS) {
+                // 首次解包可能超过 8s；本次放弃（下次真实调用会命中已解包的 pyhome）
+                Log.w(TAG, "warm timeout toolId=$toolId costMs=$bootCost reason=boot_slow")
+                return
+            }
+            if (!ProcBudget.tryAcquire(WARM_BUDGET_WAIT_MS)) {
+                Log.i(TAG, "warm skip toolId=$toolId reason=budget_busy costMs=${SystemClock.elapsedRealtime() - started}")
+                return
+            }
+            val allowed = synchronized(lock) {
+                if (idle.any { it.isAlive } || activePool.isNotEmpty()) {
+                    false
+                } else if (!canStart()) {
+                    false
+                } else {
+                    startsInWindow++
+                    true
+                }
+            }
+            if (!allowed) {
+                ProcBudget.release()
+                Log.i(TAG, "warm skip toolId=$toolId reason=pool_busy costMs=${SystemClock.elapsedRealtime() - started}")
+                return
+            }
+            worker = try {
+                Worker(b) { ProcBudget.release() }
+            } catch (t: Throwable) {
+                ProcBudget.release()
+                throw t
+            }
+            val cost = SystemClock.elapsedRealtime() - started
+            if (cost > WARM_TIMEOUT_MS) {
+                Log.w(TAG, "warm timeout toolId=$toolId costMs=$cost reason=worker_slow")
+                return
+            }
+            synchronized(lock) {
+                if (idle.any { it.isAlive }) {
+                    // 并发期间已有别的 worker 进 idle 池，丢弃当前这个（finally 关闭）
+                } else {
+                    worker.lastUsedAt = SystemClock.elapsedRealtime()
+                    idle.addLast(worker)
+                    addedToIdle = true
+                }
+            }
+            if (addedToIdle) {
+                Log.i(TAG, "warm done toolId=$toolId costMs=$cost pid=${worker.pid} rssKb=${worker.rssKb}")
+            } else {
+                Log.i(TAG, "warm skip toolId=$toolId reason=idle_worker_exists costMs=$cost")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "warm fail toolId=$toolId costMs=${SystemClock.elapsedRealtime() - started}", t)
+        } finally {
+            // 没有放进 idle 的 worker 必须关闭；close() 会释放 ProcBudget
+            if (!addedToIdle) runCatching { worker?.close() }
+            warmSemaphore.release()
+            warmingTools.remove(toolId)
         }
     }
 
