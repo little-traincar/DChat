@@ -2,7 +2,7 @@
 
 原生 Android 的 DeepSeek 客户端。**没有 WebView、没有 H5**，所有界面由 Jetpack Compose 原生绘制。
 
-> 当前版本：**1.0.3**（`versionCode 5`）
+> 当前版本：**1.0.4**（`versionCode 6`）
 > 设计文档：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（架构总览）、[`docs/PLAN.md`](docs/PLAN.md)（决策记录 D1–D91）
 
 ## 特性
