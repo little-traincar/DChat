@@ -8,7 +8,10 @@ import androidx.compose.runtime.setValue
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import com.dchat.app.ui.lang.format
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -158,7 +161,7 @@ object PyRuntime {
         code: String,
         argsJson: String = "{}",
         conversationId: String,
-        timeoutMs: Int = 5_000,
+        timeoutMs: Int = 30_000,
         conversationMode: String = "workspace",
         /** true = 后台任务（bg.run）执行，走独立线程池，允许多个任务真并发 */
         background: Boolean = false,
@@ -201,6 +204,7 @@ object PyRuntime {
                     conversationMode
                 ).toString()
             })
+            Log.i("PyRuntime", "runPythonCode timeout=" + if (timeoutMs <= 0) "unlimited" else "${timeoutMs}ms")
             val outcome = awaitWithMemoryGuard(future, timeoutMs.toLong())
             when (outcome) {
                 is AwaitOutcome.Ok -> parseResult(context, conversationId, outcome.raw)
@@ -219,6 +223,9 @@ object PyRuntime {
                         errorMessage = cause.message ?: cause.javaClass.simpleName)
                 }
             }
+        } catch (c: CancellationException) {
+            // 用户停止：不要吞掉取消信号（Future 已在 awaitWithMemoryGuard 里 cancel）
+            throw c
         } catch (t: Throwable) {
             PyResult(ok = false, errorCode = "TOOL_ERROR", errorMessage = t.message ?: t.javaClass.simpleName)
         }
@@ -244,7 +251,7 @@ object PyRuntime {
             code = tool.code,
             argsJson = argsJson,
             conversationId = conversationId,
-            timeoutMs = ToolRegistry.byId(tool.id)?.timeoutMs ?: 5_000,
+            timeoutMs = ToolRegistry.byId(tool.id)?.timeoutMs ?: 30_000,
             conversationMode = conversationMode,
             background = background,
             viaChild = false
@@ -259,7 +266,7 @@ object PyRuntime {
         code: String,
         argsJson: String,
         conversationId: String,
-        timeoutMs: Int = 5_000,
+        timeoutMs: Int = 30_000,
         conversationMode: String = "workspace",
         /** true = 后台任务（bg.run）执行，走独立线程池，允许多个任务真并发 */
         background: Boolean = false,
@@ -319,6 +326,7 @@ object PyRuntime {
                 ).toString()
                 raw
             })
+            Log.i("PyRuntime", "runCode timeout=" + if (timeoutMs <= 0) "unlimited" else "${timeoutMs}ms")
             val outcome = awaitWithMemoryGuard(future, timeoutMs.toLong())
             when (outcome) {
                 is AwaitOutcome.Ok -> parseResult(context, conversationId, outcome.raw)
@@ -337,6 +345,9 @@ object PyRuntime {
                         errorMessage = cause.message ?: cause.javaClass.simpleName)
                 }
             }
+        } catch (c: CancellationException) {
+            // 用户停止：不要吞掉取消信号（Future 已在 awaitWithMemoryGuard 里 cancel）
+            throw c
         } catch (t: Throwable) {
             PyResult(
                 ok = false,
@@ -368,28 +379,42 @@ object PyRuntime {
 
     /**
      * 等 Future 完成，同时每 200ms 采样一次 RSS：
+     * - `timeoutMs <= 0` = **不限时**：不设截止时间，只等完成 / 内存超限 / 用户停止（job 取消）；
      * - 增量 > 256MB（软限）→ 取消 Future，返回 [AwaitOutcome.MemorySoft]（Python 线程无法强杀，结果丢弃）；
-     * - 增量 > 512MB（硬限）→ 标记运行时不可用（IN_PROCESS 无法重启解释器），返回 [AwaitOutcome.MemoryHard]。
+     * - 增量 > 512MB（硬限）→ 标记运行时不可用（IN_PROCESS 无法重启解释器），返回 [AwaitOutcome.MemoryHard]；
+     * - 用户停止：协程取消后由 [ensureActive] 抛 CancellationException，先 cancel Future 再向上抛，尽快返回。
      */
-    private fun awaitWithMemoryGuard(
+    private suspend fun awaitWithMemoryGuard(
         future: java.util.concurrent.Future<String>,
         timeoutMs: Long
     ): AwaitOutcome {
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val unlimited = timeoutMs <= 0
+        val deadline = if (unlimited) Long.MAX_VALUE else System.currentTimeMillis() + timeoutMs
         val baseline = rssBytes()
         while (true) {
-            val remain = deadline - System.currentTimeMillis()
-            if (remain <= 0) {
+            try {
+                currentCoroutineContext().ensureActive()
+            } catch (c: CancellationException) {
+                future.cancel(true)
+                throw c
+            }
+            if (!unlimited && System.currentTimeMillis() >= deadline) {
                 future.cancel(true)
                 return AwaitOutcome.Timeout
             }
+            val slice = if (unlimited) {
+                MEMORY_POLL_MS
+            } else {
+                minOf(MEMORY_POLL_MS, (deadline - System.currentTimeMillis()).coerceAtLeast(1L))
+            }
             try {
-                return AwaitOutcome.Ok(future.get(minOf(remain, MEMORY_POLL_MS), TimeUnit.MILLISECONDS))
+                return AwaitOutcome.Ok(future.get(slice, TimeUnit.MILLISECONDS))
             } catch (_: TimeoutException) {
                 // 正常轮询
             } catch (e: ExecutionException) {
                 return AwaitOutcome.Error(e.cause ?: e)
             } catch (e: InterruptedException) {
+                future.cancel(true)
                 Thread.currentThread().interrupt()
                 return AwaitOutcome.Error(e)
             }

@@ -117,6 +117,7 @@ ops 类型：rect/circle/ellipse/line/polyline/path/arc/text/image/save/restore/
 Python 回调（可选）：canvas_frame(page, view_id, t_ms, dt_ms, width, height, state) -> {"ops":[...],"fps":30,"stop":false}；canvas_gesture(page, view_id, gesture, data, state) -> 同 page_action（data 含 x/y/dx/dy/scale/finger）。
 背景动画：{"type":"gradient","stops":[...],"animation":"flow","duration":8000}；预设 flow/breathe/kenburns/parallax；breathe 配 "color2":"#2C4C9E"；parallax 用 "strength":0.2..0.8。
 最小粒子示例：def canvas_frame(page, view_id, t_ms, dt_ms, w, h, state):\n  import math; ops=[{"op":"rect","x":0,"y":0,"w":w,"h":h,"fill":"#0B1020"}]\n  for i in range(40): ops.append({"op":"circle","cx":(i*97+t_ms*0.03)%w,"cy":(math.sin(i+t_ms*0.001)*0.5+0.5)*h,"r":1.6,"fill":"#FFFFFF"})\n  return {"ops":ops}
+超时提醒：canvas/建页面类工具建议 timeout_sec ≥ 60 或 0。
 """.trimIndent()
 
     // ---- 旧 prefs 字段（一次性迁移 + 镜像回写用）----

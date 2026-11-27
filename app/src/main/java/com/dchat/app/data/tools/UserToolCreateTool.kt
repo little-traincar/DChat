@@ -30,6 +30,7 @@ object UserToolCreateTool {
           "params_schema":{"type":"string","description":"参数 JSON Schema 字符串（可选），例如 {\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}}；不填表示无参数"},
           "requirements":{"type":"array","items":{"type":"string"},"description":"可选：pip 依赖包名列表（创建时只记录，安装走工具编辑页）"},
           "min_mode":{"type":"string","enum":["read_only","workspace_write","full"],"description":"最低权限档位，默认 workspace_write"},
+          "timeout_sec":{"type":"integer","description":"工具最长执行秒数，0=不限时，默认 30；请根据工具实际需要自行决定（例如纯计算 10-30、建 UI 60-120、长任务可不限）"},
           "enabled":{"type":"boolean","description":"创建后是否立即启用，默认 true"},
           "ui_mode":{"type":"string","enum":["data","schema","pages"],"description":"界面模式：data=自动渲染；schema=v2 单页；pages=v3 多页原生界面"},
           "ui":{"type":"string","description":"UI Schema JSON（v2: ui_mode=schema 时必填；v3: ui_mode=pages 时可传页面 JSON，body 缺省会生成占位）。v3 速查：version=3，body.type=column/row/stack/scroll/grid/text/button/image/divider/progress/badge/input/toggle/slider/card，最小示例 {\"version\":3,\"body\":{\"type\":\"column\",\"children\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"},
@@ -86,6 +87,10 @@ object UserToolCreateTool {
             "read_only" -> ToolMode.READ_ONLY
             "full" -> ToolMode.FULL
             else -> ToolMode.WORKSPACE_WRITE
+        }
+        val timeoutSec = args.optInt("timeout_sec", 30)
+        if (timeoutSec < 0) {
+            return fail("INVALID_TIMEOUT", "timeout_sec 必须大于等于 0（0=不限时，默认 30）")
         }
         if (name == "tool_create") {
             return fail("INVALID_NAME", "`tool_create` 是内置工具名，请换一个")
@@ -161,6 +166,8 @@ object UserToolCreateTool {
                     requirements = requirements,
                     enabled = args.optBoolean("enabled", true),
                     uiMode = uiMode,
+                    timeoutMs = if (timeoutSec == 0) 0 else
+                        (timeoutSec.toLong() * 1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                     code = code
                 )
             )
@@ -221,6 +228,7 @@ object UserToolCreateTool {
             append("，权限档位：").append(modeText)
             append(if (saved.enabled) "，已启用" else "，未启用").append("）\n")
             append("入口：").append(saved.entryFunction).append("(").append(argsHint).append(")\n")
+            append("超时：").append(if (saved.timeoutMs == 0) "不限时" else "${saved.timeoutMs / 1000}s").append("\n")
             append("下一轮请求起这个工具会出现在工具列表里，可直接按工具名调用；也可以由用户在你的工具页面打开视图。")
         }
         return PyResult(ok = true, output = output)

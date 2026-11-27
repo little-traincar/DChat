@@ -1709,6 +1709,15 @@ private fun UserToolEditor(
             initial?.id?.let { com.dchat.app.ui.tools.UiV3Store.readManifest(ctx, it)?.entry } ?: ""
         )
     }
+    var timeoutSecText by remember(toolId) {
+        mutableStateOf(
+            when {
+                initial == null -> "30"
+                initial!!.timeoutMs == 0 -> "0"
+                else -> (initial!!.timeoutMs / 1000).coerceAtLeast(1).toString()
+            }
+        )
+    }
     var params by remember(toolId) { mutableStateOf(parseParamDrafts(initial?.paramsSchema)) }
     var argsJson by remember(toolId) { mutableStateOf("{}") }
     var runOutput by remember(toolId) { mutableStateOf<String?>(null) }
@@ -1721,7 +1730,9 @@ private fun UserToolEditor(
 
     fun save() {
         error = null
+        val timeoutSec = if (timeoutSecText.isBlank()) 30 else timeoutSecText.trim().toIntOrNull()
         when {
+            timeoutSec == null || timeoutSec < 0 -> error = L.tools.editorTimeoutInvalid
             !UserToolStore.NAME_REGEX.matches(name) -> error = L.tools.editorNameInvalid
             ToolRegistry.all().any { it.id != toolId && it.name.equals(name, ignoreCase = true) } ->
                 error = L.tools.editorNameTaken
@@ -1768,7 +1779,10 @@ private fun UserToolEditor(
                         version = initial?.version ?: 0,
                         enabled = initial?.enabled ?: false,
                         code = code,
-                        uiMode = uiMode
+                        uiMode = uiMode,
+                        timeoutMs = if ((timeoutSec ?: 30) == 0) 0 else
+                            ((timeoutSec ?: 30).toLong() * 1000L)
+                                .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                     )
                 )
                 if (saved != null) onSaved() else error = L.format(L.tools.editorSaveFailed, name)
@@ -1973,6 +1987,20 @@ private fun UserToolEditor(
                         lineHeight = 15.sp
                     )
                 }
+                Spacer(Modifier.height(8.dp))
+                EditorSmallField(
+                    L.tools.editorTimeout,
+                    timeoutSecText,
+                    { v -> timeoutSecText = v.filter { it.isDigit() }.take(9) },
+                    Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    L.tools.editorTimeoutHint,
+                    fontSize = 10.5.sp,
+                    color = c.text3,
+                    lineHeight = 15.sp
+                )
                 Spacer(Modifier.height(12.dp))
 
                 Row(verticalAlignment = Alignment.CenterVertically) {

@@ -3,7 +3,10 @@ package com.dchat.app.data.tools
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -135,7 +138,7 @@ object PyProcessRuntime {
         code: String,
         argsJson: String = "{}",
         conversationId: String,
-        timeoutMs: Int = 5_000,
+        timeoutMs: Int = 30_000,
         conversationMode: String = "workspace",
         background: Boolean = false
     ): PyResult = withContext(Dispatchers.IO) {
@@ -179,7 +182,7 @@ object PyProcessRuntime {
         code: String,
         argsJson: String,
         conversationId: String,
-        timeoutMs: Int = 5_000,
+        timeoutMs: Int = 30_000,
         conversationMode: String = "workspace",
         background: Boolean = false
     ): PyResult = withContext(Dispatchers.IO) {
@@ -254,7 +257,7 @@ object PyProcessRuntime {
                 code = tool.code,
                 argsJson = argsJson,
                 conversationId = conversationId,
-                timeoutMs = ToolRegistry.byId(tool.id)?.timeoutMs ?: 5_000,
+                timeoutMs = ToolRegistry.byId(tool.id)?.timeoutMs ?: 30_000,
                 conversationMode = conversationMode
             )
         } catch (e: BootException) {
@@ -310,7 +313,9 @@ object PyProcessRuntime {
             .put("perm", conversationMode)
         if (entry != null) req.put("entry", entry) else req.put("code", code)
 
-        val timeout = timeoutMs.toLong().coerceAtLeast(1_000L)
+        // timeoutMs <= 0 = 不限时（模型自行决定）；>0 时才设截止时间，最小 1s 防误传 1ms
+        val timeout = if (timeoutMs <= 0) 0L else timeoutMs.toLong().coerceAtLeast(1_000L)
+        Log.i(TAG, "child request timeout=" + if (timeout <= 0) "unlimited" else "${timeout}ms")
         acquire()
         var worker: Worker? = null
         try {
@@ -321,7 +326,11 @@ object PyProcessRuntime {
             } catch (e: Throwable) {
                 throw StartException("child worker start failed", e)
             }
-            val resp = worker.request(req, timeout)
+            val job = currentCoroutineContext()[Job]
+            val resp = worker.request(req, timeout) {
+                // 用户点停止（协程取消）时尽快打断：由 request 循环每 250ms 检查一次
+                job?.isActive == false
+            }
             synchronized(lock) {
                 activePool.remove(worker)
                 worker.lastUsedAt = SystemClock.elapsedRealtime()
@@ -337,6 +346,9 @@ object PyProcessRuntime {
                     errorMessage = resp.optString("error").takeIf { it.isNotBlank() }
                 )
             )
+        } catch (e: CancellationException) {
+            // 用户停止：向上抛取消信号（worker 已在 request 里 close/kill）
+            throw e
         } catch (e: ChildMemoryLimit) {
             Log.w(TAG, "child memory limit exceeded, killed", e)
             return PyResult(false, errorCode = "MEMORY_LIMIT", errorMessage = e.message)
@@ -599,16 +611,35 @@ object PyProcessRuntime {
 
         val isAlive: Boolean get() = alive && process.isAlive
 
-        fun request(req: JSONObject, timeoutMs: Long): JSONObject {
+        fun request(req: JSONObject, timeoutMs: Long, isCancelled: () -> Boolean = { false }): JSONObject {
             if (!isAlive) throw IOException("child not alive")
             stdin.write(req.toString())
             stdin.newLine()
             stdin.flush()
-            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            val unlimited = timeoutMs <= 0
+            val deadline = if (unlimited) Long.MAX_VALUE else System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
             val baselineKb = rssKb
-            while (System.nanoTime() < deadline) {
-                val remainMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(1)
-                val line = queue.poll(minOf(remainMs, MEMORY_POLL_MS), TimeUnit.MILLISECONDS)
+            while (true) {
+                if (!isAlive) throw IOException("child died while waiting for response")
+                if (!unlimited && System.nanoTime() >= deadline) {
+                    close()
+                    throw ChildTimeout("child timeout after ${timeoutMs}ms; killed")
+                }
+                // 不限时也按 250ms 切片轮询：保留进程死亡/EOF 检测与内存 guard
+                val slice = if (unlimited) {
+                    MEMORY_POLL_MS
+                } else {
+                    minOf(
+                        TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(1),
+                        MEMORY_POLL_MS
+                    )
+                }
+                val line = queue.poll(slice, TimeUnit.MILLISECONDS)
+                // 用户停止：close() kill 子进程后抛取消信号（runChild 会向上抛）
+                if (isCancelled()) {
+                    close()
+                    throw CancellationException("child request cancelled by user")
+                }
                 // 内存看门狗：轮询期间采样子进程 RSS
                 val rss = rssKb
                 if (rss > 0) {
@@ -622,7 +653,10 @@ object PyProcessRuntime {
                     }
                 }
                 if (line == null) continue
-                if (line == EOF) break
+                if (line == EOF) {
+                    if (unlimited) throw IOException("child exited before response")
+                    break
+                }
                 val o = runCatching { JSONObject(line) }.getOrDefault(JSONObject())
                 if (o.optString("id").isBlank()) {
                     if (o.optString("code") == "CHILD_BOOT_FAILED") {

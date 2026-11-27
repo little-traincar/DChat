@@ -692,6 +692,9 @@ data class ToolsStr(
     val editorDescriptionRequired: String,
     val editorCodeRequired: String,
     val editorParamsInvalid: String,
+    val editorTimeout: String,
+    val editorTimeoutHint: String,
+    val editorTimeoutInvalid: String,
     val editorSaved: String,
     /** 保存失败：%s */
     val editorSaveFailed: String,

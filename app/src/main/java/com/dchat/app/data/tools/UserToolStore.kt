@@ -33,8 +33,10 @@ data class UserToolDef(
     val version: Int = 1,
     val enabled: Boolean = false,
     val code: String = "",
-    /** 4b：`data` 自动渲染 / `schema` UI 树 */
-    val uiMode: String = "data"
+    /** 4b：`data` 自动渲染 / `schema` UI 树 / `pages` v3 多页 */
+    val uiMode: String = "data",
+    /** 用户工具执行超时毫秒；0 = 不限时，旧数据缺省 30s */
+    val timeoutMs: Int = 30_000
 )
 
 object UserToolStore {
@@ -116,7 +118,8 @@ object UserToolStore {
             version = o.optInt("version", 1).coerceAtLeast(1),
             enabled = spec?.enabled ?: o.optBoolean("enabled", false),
             code = codeFile.readText(),
-            uiMode = normalizeUiMode(o.optString("uiMode"))
+            uiMode = normalizeUiMode(o.optString("uiMode")),
+            timeoutMs = o.optInt("timeoutMs", 30_000).coerceAtLeast(0)
         )
     }
 
@@ -181,7 +184,7 @@ object UserToolStore {
                     enabled = saved.enabled,
                     builtIn = false,
                     version = saved.version,
-                    timeoutMs = 5_000,
+                    timeoutMs = saved.timeoutMs,
                     entryFunction = saved.entryFunction,
                     requirements = saved.requirements,
                     uiMode = saved.uiMode
@@ -232,7 +235,7 @@ object UserToolStore {
                     enabled = def.enabled,
                     builtIn = false,
                     version = def.version,
-                    timeoutMs = 5_000,
+                    timeoutMs = def.timeoutMs,
                     entryFunction = def.entryFunction,
                     requirements = def.requirements,
                     uiMode = def.uiMode
@@ -260,6 +263,7 @@ object UserToolStore {
         .put("version", def.version)
         .put("enabled", def.enabled)
         .put("uiMode", normalizeUiMode(def.uiMode))
+        .put("timeoutMs", def.timeoutMs.coerceAtLeast(0))
 
     /** 4b：会话级工具状态；不存在时返回空对象 */
     fun readState(context: Context, toolId: String, conversationId: String): JSONObject =
