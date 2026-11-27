@@ -216,10 +216,14 @@ dchat.runAsync("get_weather",'{"city":"广州"}',"boot");
         }
 
         val merged = mergeLocked(persisted ?: emptyList(), prefs, migrate)
+        // 清理已下线/改名过的内置工具（例如 v3 时代的 local.ui_write）：只删「内置来源但已不在 seed 里」的，
+        // 绝不能误删 user.* / server 工具。
+        val seedIds = seedTools().mapTo(HashSet()) { it.id }
+        val pruned = merged.tools.filter { it.source != ToolSource.LOCAL || it.id in seedIds }
         index.clear()
-        merged.tools.forEach { index[it.id] = it }
+        pruned.forEach { index[it.id] = it }
         if (migrate) mirrorLegacyLocked()
-        if (migrate || merged.added) persistLocked()
+        if (migrate || merged.added || pruned.size != merged.tools.size) persistLocked()
     }
 
     private fun hasVersion(root: JSONObject): Boolean =
