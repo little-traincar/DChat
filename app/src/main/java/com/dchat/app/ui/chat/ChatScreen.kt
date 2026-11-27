@@ -162,6 +162,7 @@ import com.dchat.app.data.tools.ToolApproval
 import com.dchat.app.data.tools.ToolApprovalPolicy
 import com.dchat.app.data.tools.ToolApprovalRequest
 import com.dchat.app.data.api.CacheEpochNotice
+import com.dchat.app.data.chat.ChatRuntime
 import com.dchat.app.data.tools.ToolHealth
 import com.dchat.app.data.tools.ToolRegistry
 import com.dchat.app.data.tools.ToolSource
@@ -242,14 +243,12 @@ val toolSpecs = ToolRegistry.tools
     var deleteTarget by remember { mutableStateOf<Conversation?>(null) }
     // 单会话导出：点「导出这个会话」时记录当前会话快照；文件选择期间切换会话也不会导错
 var exportTarget by remember { mutableStateOf<List<Conversation>>(emptyList()) }
-    var job by remember { mutableStateOf<Job?>(null) }
+    // 1.0.3：生成任务挂在进程级 ChatRuntime 上，离开聊天页不会被取消（见 ChatRuntime 注释）
     // 「本轮生成」标识：流式回调、工具循环都是新起的协程，不能靠 job.isActive 判断
     // （外层 launch 只是把 OkHttp 请求 enqueue 出去就结束了，job 立刻变 inactive）。
     // 只有用户点停止 / 新发一轮时才把 token 换掉，工具循环据此判断是否还该继续。
-    var genToken by remember { mutableStateOf<Any?>(null) }
-    var apiCall by remember { mutableStateOf<okhttp3.Call?>(null) }
     // 1.0.3：生图占位卡的进度起点（elapsedRealtime 毫秒，0 = 当前没有进行中的生图）
-    var imageGenStartedAt by remember { mutableStateOf(0L) }
+    var imageGenStartedAt by remember { mutableStateOf(ChatRuntime.imageGenStartedAt) }
     // D97：本轮工具链的实时快照。停止生成时用它补齐「assistant 有 tool_use 但没有配对 tool_result」
     // 的悬空调用（否则下一轮请求 400）；正常结束时它也会清洗后落库给后续轮次。
     val liveRawChain = remember { mutableStateListOf<JSONObject>() }
@@ -742,8 +741,8 @@ voiceFailed.remove(m.id)
     DisposableEffect(Unit) {
         tts.init { ok -> if (ok) applyVoiceSetting() }
         onDispose {
-            apiCall?.cancel()
-            job?.cancel()
+            // 注意：这里**不能**取消生成任务（apiCall/job）——离开聊天页去设置时生成要继续；
+            // 停止生成由 stop() 统一走 ChatRuntime.cancelCurrent()
             asr.destroy()
             stopVoice()
             player.release()
@@ -775,6 +774,21 @@ LaunchedEffect(app.currentId) {
     }
     LaunchedEffect(ttsEnabled) {
         if (!ttsEnabled) stopVoice()
+    }
+
+    // 自愈：进程被杀 / 生成任务丢失后，残留的「生成中」消息不能永远转圈。
+    // 只在确实没有活跃生成任务时处理（正常流式期间 ChatRuntime.job 是 active）。
+    LaunchedEffect(app.currentId) {
+        if (ChatRuntime.job?.isActive == true) return@LaunchedEffect
+        val list = app.current()?.messages ?: return@LaunchedEffect
+        list.filter { it.status == ChatMsg.STATUS_WIP }.forEach { m ->
+            app.updateMessage(m.id) {
+                it.copy(
+                    status = ChatMsg.STATUS_FAILED,
+                    text = it.text.ifBlank { "生成已中断（应用被关闭或连接断开），可重新发送" }
+                )
+            }
+        }
     }
 
     // 历史语音消息：音频缓存还在的话先读出时长，气泡按语音长度    // （跟「语音合成」开关无关：历史语音消息要一直能显示时长和播放）
@@ -989,7 +1003,6 @@ LaunchedEffect(inputFocused) {
         if (inputFocused) follow = true
     }
 
-    DisposableEffect(Unit) { onDispose { apiCall?.cancel(); job?.cancel() } }
 
     // 浮层优先消费返回键：先关浮层，再退页面
     BackHandler(enabled = menu) { menu = false }
@@ -1113,7 +1126,7 @@ val historyMsgs = messages.filter {
         // 没填 Key：本地模
 if (s0.apiKey.isBlank()) {
             val body = buildReply(L, modelPrompt, fromVoice, search, imageCount = images.size)
-            job = scope.launch {
+            ChatRuntime.job = ChatRuntime.scope.launch {
                 for (i in 1..body.length) {
                     delay(14)
                     app.updateMessageLite(aiId) { it.copy(text = body.substring(0, i)) }
@@ -1216,10 +1229,9 @@ if (refusedText != null) {
         // 图片读盘 + base64 编码必须Dispatchers.IO 上做。失败不能静默：
         // - 本次消息的图片读不出来：Toast 提示 + 在请求文本里注明「有 N 张图片未能发送」；
         // - 历史消息的图片读不出来：直接跳过（文件可能已被清理），不影响本次发送
-job = scope.launch {
+ChatRuntime.job = ChatRuntime.scope.launch {
             // 本轮生成的标识：工具循环 / 后续轮次用它判断「这一轮是否还该继续」
-            val myGen = Any()
-            genToken = myGen
+            val myGen = ChatRuntime.begin()
             val prepared = withContext(Dispatchers.IO) {
                 // base64 内联总量按官方请求体上限8 MiB）留余量后控制在 40 MiB，超出的图片跳过
                 var budget = ChatImage.MAX_TOTAL_BYTES
@@ -1459,7 +1471,7 @@ if (s0.toolRounds > 0) {
             // 客户端工具执+ assistant(tool_use)/user(tool_result) 回传 + 后续
 val ToolLoop = object {
                 suspend fun stream(extra: List<JSONObject>) {
-                    if (genToken !== myGen) return
+                    if (!ChatRuntime.isCurrent(myGen)) return
                     // 默认（toolRounds = 0）不设客户端轮次上限：跟 DSH 一样，
                     // 什么时候停止调用工具由模型自己决定（end_turn 收尾），用户可随时点「停止」。
                     // 只有在设置里显式填了上限时才截断。
@@ -1512,8 +1524,8 @@ val ToolLoop = object {
                                         callRaw = ev.rawJson
                                         lastAssistantRaw = ev.rawJson
                                     }
-                                    scope.launch {
-                                        if (genToken !== myGen) return@launch
+                                    ChatRuntime.scope.launch {
+                                        if (!ChatRuntime.isCurrent(myGen)) return@launch
                                         when (ev) {
                                             is ApiEvent.AssistantRaw -> Unit
                                             is ApiEvent.BlockStart -> {
@@ -1625,7 +1637,7 @@ val ToolLoop = object {
                             )
                         }
                     }
-                    apiCall = call.getOrNull()
+                    ChatRuntime.call = call.getOrNull()
                 }
 
                 suspend fun continueWithTools(
@@ -1633,7 +1645,7 @@ val ToolLoop = object {
                     extra: List<JSONObject>,
                     assistantRaw: String = ""
                 ) {
-                    if (genToken !== myGen) return
+                    if (!ChatRuntime.isCurrent(myGen)) return
                     val assistantContent = JSONArray()
                     val resultContent = JSONArray()
                     var limitHit = false
@@ -1641,7 +1653,7 @@ val ToolLoop = object {
                     for (u in uses) {
                         // 用户已停止：不再执行后续工具调用（工具循环是独立 scope.launch，
                         // job.cancel() 不会自动终止它，必须每次用 genToken 校验）
-                        if (genToken !== myGen) return
+                        if (!ChatRuntime.isCurrent(myGen)) return
                         if (s0.toolRounds > 0 && clientToolCalls >= s0.toolRounds) {
                             limitHit = true
                             break
@@ -1698,6 +1710,7 @@ val ToolLoop = object {
                                 genPlaceholder = ph
                                 // 1.0.3：占位卡要显示「已用时 Ns」，记下开始时刻（elapsedRealtime）
                                 imageGenStartedAt = android.os.SystemClock.elapsedRealtime()
+                                ChatRuntime.imageGenStartedAt = imageGenStartedAt
                                 steps.add(ph)
                                 // 绕过 push 的 30fps 节流，让占位卡立刻出现
                                 lastPushAt = 0L
@@ -1732,7 +1745,7 @@ val ToolLoop = object {
                                     conversationId = convId,
                                     mode = liveMode,
                                     // 停止后丢弃迟到的生图结果（落盘前也会再查一次）
-                                    isCancelled = { genToken !== myGen }
+                                    isCancelled = { !ChatRuntime.isCurrent(myGen) }
                                 )
                             } else {
                                 val def = UserToolStore.find(ctx, spec.id)
@@ -1753,6 +1766,7 @@ val ToolLoop = object {
                             }
                             // 结果回来就撤掉占位卡；被用户停止时由 stop() 兜底清理
                             imageGenStartedAt = 0L
+                            ChatRuntime.imageGenStartedAt = 0L
                             if (genPlaceholder != null) {
                                 steps.removeAll { item -> (item as? Step.Download) === genPlaceholder }
                             }
@@ -1772,7 +1786,7 @@ val ToolLoop = object {
                         }
                         // 用户已停止：丢弃迟到的工具结果——不加卡、不回填 tool_result、不继续下一轮。
                         // 工具循环跑在独立 scope.launch 里，job.cancel() 无法中断阻塞中的生图请求。
-                        if (genToken !== myGen) return
+                        if (!ChatRuntime.isCurrent(myGen)) return
                         val elapsed = android.os.SystemClock.elapsedRealtime() - started
                         val resultText = if (ok) {
                             output
@@ -2042,8 +2056,8 @@ requestTools = requestTools,
                         requestTag = "$cacheTurnNo.1",
                         onEvent = { ev ->
                             if (ev is ApiEvent.AssistantRaw) lastAssistantRaw = ev.rawJson
-                            scope.launch {
-                                if (genToken !== myGen) return@launch
+                            ChatRuntime.scope.launch {
+                                if (!ChatRuntime.isCurrent(myGen)) return@launch
                                 when (ev) {
                                     is ApiEvent.AssistantRaw -> Unit
                                     is ApiEvent.BlockStart -> {
@@ -2099,7 +2113,7 @@ if (ev.stopReason == "refusal") {
                                             val uses = pendingToolUses.toList()
                                             pendingToolUses.clear()
                                             push(false)
-                                            scope.launch { ToolLoop.continueWithTools(uses, emptyList(), lastAssistantRaw) }
+                                            ChatRuntime.scope.launch { ToolLoop.continueWithTools(uses, emptyList(), lastAssistantRaw) }
                                         } else {
                                             if (lastAssistantRaw.isNotBlank()) {
                                                 liveRawChain.add(
@@ -2164,17 +2178,14 @@ val msg = e.message ?: L.chat.requestBuildFailed
                     )
                 }
             }
-            apiCall = call.getOrNull()
+            ChatRuntime.call = call.getOrNull()
         }
     }
 
     fun stop() {
-        apiCall?.cancel()
-        apiCall = null
-        genToken = null
+        // 进程级运行时统一取消：断流 + 作废 token + 取消协程（离开页面后回来也能停）
+        ChatRuntime.cancelCurrent()
         imageGenStartedAt = 0L
-        job?.cancel()
-        job = null
         // 停止时同时取消正在跑的 TTS（synthesize/speak），否则语音气泡会卡在「合成中…」
         runCatching { tts.stop() }
         synthesizingId = null
