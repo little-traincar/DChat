@@ -111,6 +111,12 @@ entry.py 事件（不要再写 v2 的 load/action，v3 页面用下面两个）�
   def page_load(page, args, state) -> dict：返回 {"state": {...}} 初始化页面状态。
   def page_action(page, action, params, state) -> dict：返回 {"state":{...}} 合并状态、{"navigate":"settings"} 跳页、{"back":True} 返回、{"toast":"已保存"}。
 示例：page_load("home", {}, {}) 返回 {"state":{"city":"广州","temp":16}}，页面 text 写 "{{state.city}} {{state.temp}}°"。
+【P3 canvas/tick/手势速查】
+canvas 节点：{"type":"canvas","id":"sky","height":240,"width":"fill","tick":true,"fps":30,"gestures":["tap","pan"],"ops":[...]}（tick 默认 false，fps 10..30，id 用于回调定位）。
+ops 类型：rect/circle/ellipse/line/polyline/path/arc/text/image/save/restore/translate/scale/rotate/alpha/clipRect。坐标 dp；fill/stroke 可为 "#RRGGBB" 或渐变 {"type":"linear","from":[0,0],"to":[240,0],"stops":[["#4D6BFE",0],["#E8835A",1]]} / {"type":"radial","center":[120,120],"radius":120,"stops":[...]}。单 canvas ops ≤800。
+Python 回调（可选）：canvas_frame(page, view_id, t_ms, dt_ms, width, height, state) -> {"ops":[...],"fps":30,"stop":false}；canvas_gesture(page, view_id, gesture, data, state) -> 同 page_action（data 含 x/y/dx/dy/scale/finger）。
+背景动画：{"type":"gradient","stops":[...],"animation":"flow","duration":8000}；预设 flow/breathe/kenburns/parallax；breathe 配 "color2":"#2C4C9E"；parallax 用 "strength":0.2..0.8。
+最小粒子示例：def canvas_frame(page, view_id, t_ms, dt_ms, w, h, state):\n  import math; ops=[{"op":"rect","x":0,"y":0,"w":w,"h":h,"fill":"#0B1020"}]\n  for i in range(40): ops.append({"op":"circle","cx":(i*97+t_ms*0.03)%w,"cy":(math.sin(i+t_ms*0.001)*0.5+0.5)*h,"r":1.6,"fill":"#FFFFFF"})\n  return {"ops":ops}
 """.trimIndent()
 
     // ---- 旧 prefs 字段（一次性迁移 + 镜像回写用）----

@@ -437,7 +437,6 @@ fun ToolUiScreen(toolId: String, onBack: () -> Unit, conversationId: String? = n
             conversationMode = convMode,
             conversationId = conversationId,
             manifest = v3Manifest,
-            fallbackTitle = fallbackTitle,
             onExit = onBack
         )
         return

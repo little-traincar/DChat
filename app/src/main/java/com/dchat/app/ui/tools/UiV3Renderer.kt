@@ -1,10 +1,22 @@
 package com.dchat.app.ui.tools
 
 import android.os.Build
+import android.util.Log
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -34,9 +46,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -45,9 +60,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -55,14 +79,23 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.dchat.app.ui.CompactSwitch
 import com.dchat.app.ui.theme.DarkColors
 import com.dchat.app.ui.theme.LocalColors
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /**
  * 工具 UI v3 的 Compose 渲染器（规范见 `docs/spec/tool-ui-v3.md`）。
@@ -74,6 +107,13 @@ import kotlin.math.roundToInt
  * - 图片由宿主通过 [onResolveImage] 解析成绝对路径，渲染器负责 IO 线程采样解码 + LruCache。
  * - 全部原生 Compose，无 WebView/H5。
  */
+/** canvas_frame 回调返回：ops 替换当前帧；fps=0 保持当前帧率；stop=true 停止该画布循环并保留最后一帧。 */
+data class CanvasFrame(
+    val ops: List<UiOp> = emptyList(),
+    val fps: Int = 0,
+    val stop: Boolean = false
+)
+
 @Composable
 fun UiV3Page(
     page: UiPage,
@@ -81,6 +121,10 @@ fun UiV3Page(
     onAction: (action: String, params: JSONObject) -> Unit,
     onStateChange: (key: String, value: Any?) -> Unit,
     onResolveImage: ((String) -> String?)? = null,
+    onCanvasFrame: ((String, Long, Long, Float, Float) -> CanvasFrame?)? = null,
+    onCanvasGesture: ((String, String, JSONObject) -> Unit)? = null,
+    scrollOffset: () -> Float = { 0f },
+    drawPageBackground: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val appColors = LocalColors.current
@@ -94,65 +138,168 @@ fun UiV3Page(
     val stateKey = state.toString()
     val resolved = remember(page, stateKey) { resolvePage(page, state) }
 
+    val pageScroll = rememberScrollState()
+    // parallax 偏移（px）：页面自身滚动 + 宿主附加偏移；以 lambda 懒求值，滚动时不必整页重组
+    val pageScrollOffset: () -> Float = {
+        pageScroll.value.toFloat() + (runCatching { scrollOffset() }.getOrDefault(0f))
+    }
+
     val ctx = V3Ctx(
         colors = colors,
         fontScale = fontScale,
         state = state,
         onAction = onAction,
         onStateChange = onStateChange,
-        onResolveImage = onResolveImage
+        onResolveImage = onResolveImage,
+        onCanvasFrame = onCanvasFrame,
+        onCanvasGesture = onCanvasGesture
     )
 
     Box(modifier = modifier.fillMaxSize()) {
-        PageBackground(resolved.background, colors, onResolveImage)
+        // drawPageBackground=false 时这一层完全透明，背景由宿主用 UiV3Background 铺满（spec §8）
+        if (drawPageBackground) {
+            PageBackground(resolved.background, colors, onResolveImage, pageScrollOffset)
+        }
 
         val body = resolved.body
-        if (body == null) {
-            PageError(resolved.error ?: "未知错误", colors)
-        } else if (body.type == "scroll") {
-            // 页面 body 自身就是滚动容器时，把宿主的约束直接给它
-            RenderNode(body, ctx, Modifier.fillMaxSize())
-        } else {
-            // body 默认就是 scroll 语义（规范 2.3）
-            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                RenderNode(body, ctx)
+        when {
+            body == null -> PageError(resolved.error ?: "未知错误", colors)
+            body.type == "scroll" -> {
+                // body 自身是滚动容器：把页面滚动状态共享给它，parallax 仍可用
+                RenderNode(body, ctx.copy(pageScroll = pageScroll), Modifier.fillMaxSize())
+            }
+
+            else -> {
+                // body 默认就是 scroll 语义（规范 2.3）
+                Column(Modifier.fillMaxSize().verticalScroll(pageScroll)) {
+                    RenderNode(body, ctx)
+                }
             }
         }
     }
 }
 
-/* ==================== 页面背景 ==================== */
+/* ==================== 页面背景（spec §4/§8） ==================== */
+
+/**
+ * 全屏/局部背景（宿主可直接调用）：自己负责 fillMaxSize、渐变/图片/blur/scrim/opacity
+ * 和 flow/breathe/kenburns/parallax 预设；不裁剪外框，宿主可以放到所有栏位下面。
+ *
+ * [background] 为 null 时画纯色 `LocalColors.bg`；[scrollOffset] 是 parallax 用的懒求值像素偏移。
+ */
+@Composable
+fun UiV3Background(
+    background: UiBackground?,
+    modifier: Modifier = Modifier,
+    onResolveImage: ((String) -> String?)? = null,
+    scrollOffset: () -> Float = { 0f }
+) {
+    val fallback = LocalColors.current.bg
+    if (background == null) {
+        Box(modifier.fillMaxSize().background(fallback))
+        return
+    }
+    BackgroundLayer(
+        background = background,
+        modifier = modifier.fillMaxSize(),
+        onResolveImage = onResolveImage,
+        scrollOffset = scrollOffset,
+        fallbackBg = fallback
+    )
+}
 
 @Composable
 private fun PageBackground(
     background: UiBackground?,
     colors: UiV3Colors,
-    onResolveImage: ((String) -> String?)?
+    onResolveImage: ((String) -> String?)?,
+    scrollOffset: () -> Float
 ) {
     if (background == null) {
         Box(Modifier.fillMaxSize().background(colors.bg))
         return
     }
-    when (background.type.trim().lowercase()) {
-        "gradient" -> Box(
-            Modifier
-                .fillMaxSize()
-                .drawBehind { drawRect(uiV3GradientBrush(background, size, colors.bg)) }
-        )
+    BackgroundLayer(
+        background = background,
+        modifier = Modifier.fillMaxSize(),
+        onResolveImage = onResolveImage,
+        scrollOffset = scrollOffset,
+        fallbackBg = colors.bg
+    )
+}
 
+/** 背景实体：纯色 / 渐变 / 图片 + 内置动画预设。 */
+@Composable
+private fun BackgroundLayer(
+    background: UiBackground,
+    modifier: Modifier,
+    onResolveImage: ((String) -> String?)?,
+    scrollOffset: () -> Float,
+    fallbackBg: Color
+) {
+    val type = background.type.trim().lowercase()
+    val animation = background.animation.trim().lowercase()
+    val duration = background.duration.coerceIn(1_000, 60_000)
+    val strength = background.strength.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+    val animated = when (type) {
+        "image" -> animation == "kenburns"
+        "gradient" -> animation == "flow" || animation == "breathe"
+        else -> animation == "breathe"
+    }
+    val transition = if (animated) rememberInfiniteTransition(label = "uiV3bg") else null
+    val flowState = if (transition != null && animation == "flow") {
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(duration, easing = LinearEasing), RepeatMode.Restart),
+            label = "flow"
+        )
+    } else {
+        null
+    }
+    val breatheState = if (transition != null && animation == "breathe") {
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                tween((duration / 2).coerceAtLeast(300), easing = FastOutSlowInEasing),
+                RepeatMode.Reverse
+            ),
+            label = "breathe"
+        )
+    } else {
+        null
+    }
+    val kenburnsState = if (transition != null && animation == "kenburns") {
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                tween((duration / 2).coerceAtLeast(300), easing = FastOutSlowInEasing),
+                RepeatMode.Reverse
+            ),
+            label = "kenburns"
+        )
+    } else {
+        null
+    }
+    val parallax = animation == "parallax"
+
+    when (type) {
         "image" -> {
             val path = remember(background.src, onResolveImage) {
                 resolveUiImagePath(background.src, onResolveImage)
             }
             val bitmap = rememberUiBitmap(path, 2048)
-            Box(Modifier.fillMaxSize().background(colors.bg)) {
+            val opacity = background.opacity.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f
+            val scrim = background.scrim.takeIf { it.isFinite() }?.coerceIn(0f, 0.8f) ?: 0f
+            val blurModifier = if (Build.VERSION.SDK_INT >= 31 && background.blur > 0) {
+                Modifier.blur(background.blur.coerceIn(0, 24).toFloat().dp)
+            } else {
+                Modifier
+            }
+            Box(modifier.background(fallbackBg)) {
                 if (bitmap != null) {
-                    // Android 12+ 用 RenderEffect 模糊；低版本忽略模糊只保留 scrim（规范 2.1）
-                    val blurModifier = if (Build.VERSION.SDK_INT >= 31 && background.blur > 0) {
-                        Modifier.blur(background.blur.coerceIn(0, 24).toFloat().dp)
-                    } else {
-                        Modifier
-                    }
                     Image(
                         bitmap = bitmap,
                         contentDescription = null,
@@ -164,22 +311,80 @@ private fun PageBackground(
                         modifier = Modifier
                             .fillMaxSize()
                             .clipToBounds()
-                            .alpha(background.opacity.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f)
+                            .alpha(opacity)
                             .then(blurModifier)
+                            .graphicsLayer {
+                                val kb = kenburnsState?.value
+                                if (kb != null) {
+                                    val scale = 1.06f + 0.06f * kb
+                                    scaleX = scale
+                                    scaleY = scale
+                                    translationX = -size.width * 0.03f * (kb - 0.5f) * 2f
+                                    translationY = -size.height * 0.025f * (kb - 0.5f) * 2f
+                                }
+                                if (parallax) {
+                                    val offset = scrollOffset().takeIf { it.isFinite() } ?: 0f
+                                    scaleX = 1.08f
+                                    scaleY = 1.08f
+                                    translationY = -offset * strength
+                                }
+                            }
                     )
                 }
-                val scrim = background.scrim.takeIf { it.isFinite() }?.coerceIn(0f, 0.8f) ?: 0f
                 if (scrim > 0f) {
-                    Box(
-                        Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = scrim))
-                    )
+                    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = scrim)))
                 }
             }
         }
 
-        else -> Box(Modifier.fillMaxSize().background(parseHexColor(background.value) ?: colors.bg))
+        "gradient" -> {
+            // 注意：graphicsLayer 必须在外层，才能把 drawBehind 画的渐变一起位移
+            val parallaxLayer = if (parallax) {
+                Modifier.graphicsLayer {
+                    val offset = scrollOffset().takeIf { it.isFinite() } ?: 0f
+                    scaleX = 1.08f
+                    scaleY = 1.08f
+                    translationY = -offset * strength
+                }
+            } else {
+                Modifier
+            }
+            Box(
+                parallaxLayer
+                    .then(modifier)
+                    .drawBehind {
+                        val flow = flowState?.value
+                        val animated = if (flow != null) {
+                            background.copy(angle = background.angle + sin(flow * 2f * PI.toFloat()) * 30f)
+                        } else {
+                            background
+                        }
+                        drawRect(uiV3GradientBrush(animated, size, fallbackBg))
+                        val breathe = breatheState?.value
+                        if (breathe != null) {
+                            val second = parseHexColor(background.color2)
+                                ?: lerp(fallbackBg, Color.White, 0.18f)
+                            drawRect(second.copy(alpha = (breathe * 0.35f).coerceIn(0f, 1f)))
+                        }
+                    }
+            )
+        }
+
+        else -> {
+            val color = parseHexColor(background.value) ?: fallbackBg
+            if (breatheState == null) {
+                Box(modifier.background(color))
+            } else {
+                val second = parseHexColor(background.color2)
+                    ?: if (color.luminance() > 0.55f) lerp(color, Color.Black, 0.12f) else lerp(color, Color.White, 0.18f)
+                Box(
+                    modifier.drawBehind {
+                        val f = breatheState.value.coerceIn(0f, 1f)
+                        drawRect(lerp(color, second, f))
+                    }
+                )
+            }
+        }
     }
 }
 
@@ -194,7 +399,11 @@ private data class V3Ctx(
     val onStateChange: (String, Any?) -> Unit,
     val onResolveImage: ((String) -> String?)?,
     val inRow: Boolean = false,
-    val inStack: Boolean = false
+    val inStack: Boolean = false,
+    val onCanvasFrame: ((String, Long, Long, Float, Float) -> CanvasFrame?)? = null,
+    val onCanvasGesture: ((String, String, JSONObject) -> Unit)? = null,
+    /** 页面级滚动状态：只给 body 根的 scroll 节点复用，用于 parallax */
+    val pageScroll: ScrollState? = null
 )
 
 private class RPage(
@@ -225,10 +434,16 @@ private class RNode(
 
 private val CONTAINER_TYPES = setOf("column", "row", "stack", "scroll", "grid", "card")
 
+/** canvas 单帧 ops 上限（spec §1/§4）。 */
+private const val MAX_CANVAS_OPS = 800
+private const val MAX_CANVAS_IMAGES = 20
+private const val UI_V3_CANVAS_TAG = "UiV3Canvas"
+private val CANVAS_GESTURES = setOf("tap", "down", "up", "move", "pan", "swipe", "longpress")
+
 /** 没写 width 时默认撑满的类型（在 Row 里除外）。 */
 private val DEFAULT_FILL_TYPES = setOf(
     "column", "row", "stack", "scroll", "grid", "card",
-    "button", "image", "divider", "progress", "slider", "input", "toggle"
+    "button", "image", "divider", "progress", "slider", "input", "toggle", "canvas"
 )
 
 private class BuildBudget {
@@ -464,6 +679,7 @@ private fun RenderNode(rn: RNode, ctx: V3Ctx, modifier: Modifier = Modifier) {
         "input" -> InputNode(rn, ctx, m, pad)
         "toggle" -> ToggleNode(rn, ctx, m, pad)
         "slider" -> SliderNode(rn, ctx, m, pad)
+        "canvas" -> CanvasNode(rn, ctx, m, pad)
         else -> Placeholder(rn.type, null, colors, modifier)
     }
 }
@@ -552,11 +768,16 @@ private fun ContainerNode(rn: RNode, ctx: V3Ctx, m: Modifier) {
             }
         }
 
-        "scroll" -> Column(
-            modifier = m.padding(pad).verticalScroll(rememberScrollState()),
-            verticalArrangement = verticalArrangement
-        ) {
-            rn.children.forEach { child -> ColumnChild(child, ctx) }
+        "scroll" -> {
+            // body 根的 scroll 复用页面滚动状态（parallax 联动）；嵌套 scroll 各自独立
+            val scrollState = ctx.pageScroll ?: rememberScrollState()
+            val childCtx = if (ctx.pageScroll != null) ctx.copy(pageScroll = null) else ctx
+            Column(
+                modifier = m.padding(pad).verticalScroll(scrollState),
+                verticalArrangement = verticalArrangement
+            ) {
+                rn.children.forEach { child -> ColumnChild(child, childCtx) }
+            }
         }
 
         "grid" -> {
@@ -928,6 +1149,238 @@ private fun SliderNode(rn: RNode, ctx: V3Ctx, m: Modifier, pad: PaddingValues) {
                 inactiveTrackColor = colors.line
             )
         )
+    }
+}
+
+/* ---------------- Canvas / tick / 手势 ---------------- */
+
+@Composable
+private fun CanvasNode(rn: RNode, ctx: V3Ctx, m: Modifier, pad: PaddingValues) {
+    val node = rn.node
+    val viewId = node.id.trim()
+    val density = LocalDensity.current.density
+    val staticOps = remember(node.ops) {
+        if (node.ops.size > MAX_CANVAS_OPS) {
+            Log.w(
+                UI_V3_CANVAS_TAG,
+                "canvas $viewId 静态 ops ${node.ops.size} 条，截断到 $MAX_CANVAS_OPS"
+            )
+            node.ops.take(MAX_CANVAS_OPS)
+        } else {
+            node.ops
+        }
+    }
+    var frameOps by remember(viewId, staticOps) { mutableStateOf(staticOps) }
+    var stopped by remember(viewId, staticOps) { mutableStateOf(false) }
+    val canvasSize = remember(viewId) { mutableStateOf(IntSize.Zero) }
+    val frameCallback by rememberUpdatedState(ctx.onCanvasFrame)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val opRenderer = remember(viewId) { UiV3OpRenderer() }
+    val imagePaths = remember(viewId) { mutableStateMapOf<String, String>() }
+    val images = remember(viewId) { mutableStateMapOf<String, ImageBitmap>() }
+
+    // 图片 op 来源（只在 src 集合变化时重新预加载，每帧不解析图片数据）
+    val imageSources = remember(frameOps, staticOps) {
+        val out = LinkedHashSet<String>()
+        for (op in frameOps + staticOps) {
+            if (out.size >= MAX_CANVAS_IMAGES) break
+            if (op.type == "image" && op.src.isNotBlank()) out.add(op.src)
+        }
+        out
+    }
+    LaunchedEffect(viewId, imageSources) {
+        for (src in imageSources) {
+            if (!imagePaths.containsKey(src)) {
+                imagePaths[src] = runCatching { resolveUiImagePath(src, ctx.onResolveImage) }
+                    .getOrNull().orEmpty()
+            }
+            val path = imagePaths[src].orEmpty()
+            if (path.isBlank() || images.containsKey(path)) continue
+            val bitmap = runCatching { uiV3LoadBitmap(path, 1024) }.getOrNull() ?: continue
+            images[path] = bitmap
+        }
+    }
+
+    // 帧循环：只在 tick=true、RESUMED、回调存在时跑；stop/null/异常都保留上一帧
+    LaunchedEffect(viewId, node.tick, node.fps, stopped) {
+        if (viewId.isBlank() || !node.tick || frameCallback == null || stopped) return@LaunchedEffect
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            var startNs = 0L
+            var lastCallbackMs = -1L
+            var intervalMs = (1000L / node.fps.coerceIn(10, 30)).coerceAtLeast(1L)
+            var lastWarnMs = -10_000L
+            var stopNow = false
+            while (isActive && !stopNow) {
+                withFrameNanos { frameNs ->
+                    if (startNs == 0L) startNs = frameNs
+                    val tMs = ((frameNs - startNs) / 1_000_000L).coerceAtLeast(0L)
+                    if (lastCallbackMs < 0L || tMs - lastCallbackMs >= intervalMs) {
+                        val size = canvasSize.value
+                        if (size.width > 0 && size.height > 0) {
+                            val dtMs = if (lastCallbackMs < 0L) 0L else (tMs - lastCallbackMs).coerceAtLeast(0L)
+                            lastCallbackMs = tMs
+                            val frame = try {
+                                frameCallback?.invoke(
+                                    viewId,
+                                    tMs,
+                                    dtMs,
+                                    size.width / density,
+                                    size.height / density
+                                )
+                            } catch (t: Throwable) {
+                                Log.w(UI_V3_CANVAS_TAG, "canvas_frame $viewId 异常：${t.message}")
+                                null
+                            }
+                            if (frame != null) {
+                                if (frame.ops.size > MAX_CANVAS_OPS) {
+                                    if (tMs - lastWarnMs >= 5_000L) {
+                                        Log.w(
+                                            UI_V3_CANVAS_TAG,
+                                            "canvas $viewId 单帧 ops ${frame.ops.size} 条，截断到 $MAX_CANVAS_OPS"
+                                        )
+                                        lastWarnMs = tMs
+                                    }
+                                    frameOps = frame.ops.take(MAX_CANVAS_OPS)
+                                } else {
+                                    frameOps = frame.ops
+                                }
+                                if (frame.fps in 10..30) {
+                                    intervalMs = (1000L / frame.fps).coerceAtLeast(1L)
+                                }
+                                if (frame.stop) stopNow = true
+                            }
+                        }
+                    }
+                }
+            }
+            if (stopNow) stopped = true
+        }
+    }
+
+    val gestureModifier = canvasGestureModifier(viewId, node, ctx, density)
+    val defaultHeight = if (node.height <= 0) Modifier.height(200.dp) else Modifier
+    Canvas(
+        modifier = m
+            .then(defaultHeight)
+            .padding(pad)
+            .clipToBounds()
+            .onSizeChanged { canvasSize.value = it }
+            .then(gestureModifier)
+    ) {
+        val native = drawContext.canvas.nativeCanvas
+        val base = native.save()
+        try {
+            native.scale(density, density)
+            runCatching {
+                opRenderer.render(this, frameOps, { src ->
+                    val path = imagePaths[src]
+                    if (path.isNullOrBlank()) null else images[path]
+                }, ctx.colors.text1)
+            }
+        } finally {
+            runCatching { native.restoreToCount(base) }
+        }
+    }
+}
+
+@Composable
+private fun canvasGestureModifier(
+    viewId: String,
+    node: UiNode,
+    ctx: V3Ctx,
+    density: Float
+): Modifier {
+    val gestureSet = remember(node.gestures) {
+        node.gestures.map { it.trim().lowercase() }
+            .filter { it in CANVAS_GESTURES }
+            .toSet()
+    }
+    val callback = ctx.onCanvasGesture
+    if (viewId.isBlank() || gestureSet.isEmpty() || callback == null) return Modifier
+    val currentCallback by rememberUpdatedState(callback)
+    val gesturesKey = remember(gestureSet) { gestureSet.toList() }
+
+    return Modifier.pointerInput(viewId, gesturesKey) {
+        val longPressMs = viewConfiguration.longPressTimeoutMillis
+        val touchSlop = viewConfiguration.touchSlop
+        val swipeMin = 48.dp.toPx()
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            val pointerId = down.id
+            val start = down.position
+            var last = start
+            var moved = false
+            var longPressFired = false
+            var holdExpired = false
+            var totalDx = 0f
+            var totalDy = 0f
+            val downAt = System.currentTimeMillis()
+
+            fun emit(gesture: String, x: Float, y: Float, dx: Float, dy: Float) {
+                if (gesture !in gestureSet) return
+                val data = JSONObject()
+                    .put("x", (x / density).toDouble())
+                    .put("y", (y / density).toDouble())
+                    .put("dx", (dx / density).toDouble())
+                    .put("dy", (dy / density).toDouble())
+                    .put("scale", 1.0)
+                    .put("finger", 0)
+                runCatching { currentCallback(viewId, gesture, data) }
+            }
+
+            emit("down", start.x, start.y, 0f, 0f)
+            var finished = false
+            while (!finished) {
+                val remaining = if (!holdExpired && !moved) {
+                    (longPressMs - (System.currentTimeMillis() - downAt)).coerceAtLeast(1L)
+                } else {
+                    0L
+                }
+                val event = if (remaining > 0L) {
+                    withTimeoutOrNull(remaining) { awaitPointerEvent() }
+                } else {
+                    awaitPointerEvent()
+                }
+                if (event == null) {
+                    if (!holdExpired && !moved) {
+                        holdExpired = true
+                        // 只有声明了 longpress 才上报；没声明时按普通 tap 处理
+                        if ("longpress" in gestureSet) {
+                            longPressFired = true
+                            emit("longpress", last.x, last.y, 0f, 0f)
+                        }
+                    }
+                    continue
+                }
+                val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+                val position = change.position
+                if (change.pressed) {
+                    val dx = position.x - last.x
+                    val dy = position.y - last.y
+                    if (abs(dx) > 0.01f || abs(dy) > 0.01f) {
+                        totalDx += dx
+                        totalDy += dy
+                        emit("move", position.x, position.y, dx, dy)
+                        if (!moved && (abs(totalDx) > touchSlop || abs(totalDy) > touchSlop)) {
+                            moved = true
+                        }
+                        if (moved) {
+                            emit("pan", position.x, position.y, totalDx, totalDy)
+                            if ("pan" in gestureSet) change.consume()
+                        }
+                    }
+                    last = position
+                } else {
+                    emit("up", position.x, position.y, 0f, 0f)
+                    if (!longPressFired && !moved) {
+                        emit("tap", position.x, position.y, 0f, 0f)
+                    } else if (moved && abs(totalDx) + abs(totalDy) > swipeMin) {
+                        emit("swipe", position.x, position.y, totalDx, totalDy)
+                    }
+                    finished = true
+                }
+            }
+        }
     }
 }
 

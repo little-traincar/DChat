@@ -30,7 +30,13 @@ object UiV2Protocol {
     /** v3 页面动作入口 */
     const val ENTRY_V3_ACTION = "__dchat_v3_action"
 
-    /** 追加到用户代码末尾的适配器（v2 + v3 共用一段，重复追加只发生一次） */
+    /** v3 canvas 逐帧回调入口（P3，规范 `tool-ui-v3-canvas.md` §3） */
+    const val ENTRY_V3_CANVAS_FRAME = "__dchat_v3_canvas_frame"
+
+    /** v3 canvas 手势回调入口 */
+    const val ENTRY_V3_CANVAS_GESTURE = "__dchat_v3_canvas_gesture"
+
+    /** 追加到用户代码末尾的适配器（v2 + v3 页面 + v3 canvas 共用一段，重复追加只发生一次） */
     val ADAPTER: String = """
 def __dchat_v2_arg_count(fn, fallback):
     try:
@@ -76,12 +82,31 @@ def __dchat_v3_action(payload):
     if not callable(fn):
         return {"state": {}, "toast": ""}
     return fn(payload.get("page", ""), payload.get("action", ""), payload.get("params") or {}, payload.get("state") or {})
+
+def __dchat_v3_canvas_frame(payload):
+    fn = globals().get("canvas_frame")
+    if not callable(fn):
+        return None
+    return fn(payload.get("page", ""), payload.get("view_id", ""),
+              payload.get("t_ms", 0), payload.get("dt_ms", 0),
+              payload.get("width", 0), payload.get("height", 0),
+              payload.get("state") or {})
+
+def __dchat_v3_canvas_gesture(payload):
+    fn = globals().get("canvas_gesture")
+    if not callable(fn):
+        return None
+    return fn(payload.get("page", ""), payload.get("view_id", ""),
+              payload.get("gesture", ""), payload.get("data") or {},
+              payload.get("state") or {})
 """.trimIndent()
 
     private val LOAD_DEF = Regex("(?m)^\\s*def\\s+load\\s*\\(")
     private val ACTION_DEF = Regex("(?m)^\\s*def\\s+action\\s*\\(")
     private val PAGE_LOAD_DEF = Regex("(?m)^\\s*def\\s+page_load\\s*\\(")
     private val PAGE_ACTION_DEF = Regex("(?m)^\\s*def\\s+page_action\\s*\\(")
+    private val CANVAS_FRAME_DEF = Regex("(?m)^\\s*def\\s+canvas_frame\\s*\\(")
+    private val CANVAS_GESTURE_DEF = Regex("(?m)^\\s*def\\s+canvas_gesture\\s*\\(")
 
     /** 是否声明了 v2 的 `load()`（决定打开页面后是否后台刷新、动作后是否 refresh） */
     fun hasLoad(code: String): Boolean = LOAD_DEF.containsMatchIn(code)
@@ -97,6 +122,18 @@ def __dchat_v3_action(payload):
 
     /** v3 是否声明了 `page_action()`；未声明时宿主忽略按钮动作（不白跑一次 Python） */
     fun hasPageAction(code: String): Boolean = PAGE_ACTION_DEF.containsMatchIn(code)
+
+    /**
+     * v3 是否声明了 canvas 逐帧回调 `canvas_frame()`。
+     * 未声明时宿主不启帧循环（`tick=true` 的 canvas 退化为静态 `node.ops` 一帧）。
+     */
+    fun hasCanvasFrame(code: String): Boolean = CANVAS_FRAME_DEF.containsMatchIn(code)
+
+    /**
+     * v3 是否声明了 canvas 手势回调 `canvas_gesture()`。
+     * 未声明时宿主把 canvas 节点的 `action` 退化为 `page_action(page, action, data, state)`。
+     */
+    fun hasCanvasGesture(code: String): Boolean = CANVAS_GESTURE_DEF.containsMatchIn(code)
 
     /** 拼上适配器；重复调用不会重复追加 */
     fun adaptedCode(code: String): String =
@@ -139,6 +176,41 @@ def __dchat_v3_action(payload):
         .put("page", page)
         .put("action", action)
         .put("params", params)
+        .put("state", state)
+
+    /**
+     * v3 canvas 逐帧 payload（规范 `tool-ui-v3-canvas.md` §3）。
+     * width/height 是 canvas 内 dp；state 是当前页 state 快照。
+     */
+    fun v3CanvasFramePayload(
+        page: String,
+        viewId: String,
+        tMs: Long,
+        dtMs: Long,
+        width: Float,
+        height: Float,
+        state: JSONObject
+    ): JSONObject = JSONObject()
+        .put("page", page)
+        .put("view_id", viewId)
+        .put("t_ms", tMs)
+        .put("dt_ms", dtMs)
+        .put("width", width)
+        .put("height", height)
+        .put("state", state)
+
+    /** v3 canvas 手势 payload；data 含 x/y/dx/dy/scale/finger（canvas dp），state 为当前页快照 */
+    fun v3CanvasGesturePayload(
+        page: String,
+        viewId: String,
+        gesture: String,
+        data: JSONObject,
+        state: JSONObject
+    ): JSONObject = JSONObject()
+        .put("page", page)
+        .put("view_id", viewId)
+        .put("gesture", gesture)
+        .put("data", data)
         .put("state", state)
 
     /** 解析 Python 返回的 JSON 对象（dict）；不是对象时返回 null */
