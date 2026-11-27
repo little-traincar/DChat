@@ -3,6 +3,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 工具 droid.vibrate：普通权限，未声明时 Vibrator.vibrate 会抛 SecurityException -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 工具 droid.take_photo：系统相机 ACTION_IMAGE_CAPTURE 本身不需要该权限；
+         声明后 DroidHost 会额外申请运行时 CAMERA 权限（拒绝返回 DROID_DENIED） -->
+    <uses-permission android:name="android.permission.CAMERA" />
     <!-- 发送位置消息需要；只申请，不强制（拒绝时 Toast 说明并返回） -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />

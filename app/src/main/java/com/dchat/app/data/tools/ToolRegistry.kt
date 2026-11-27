@@ -73,7 +73,7 @@ object ToolRegistry {
     private const val ID_LOCAL_WEB_SEARCH = "local.web_search"
     private const val ID_LOCAL_WEB_FETCH = "local.web_fetch"
     private const val ID_LOCAL_TOOL_LIST = "local.tool_list"
-    private const val ID_UI_WRITE = "local.ui_write"
+    private const val ID_WEB_WRITE = "local.web_write"
     private const val ID_IMAGEGEN = "local.imagegen"
     /** 第五期：模型自建用户工具（写 entry.py + tool.json 并注册） */
     private const val ID_TOOL_CREATE = "local.tool_create"
@@ -93,31 +93,17 @@ object ToolRegistry {
     private const val ID_SCHEDULE_CANCEL = "schedule.cancel"
 
     /**
-     * 模型侧的「工具 UI v3 速查」。内置在 tool_create / ui_write 的 description 里，
-     * 否则模型不知道 pages 模式和页面 JSON 写法（会按 v2 的 load/action 猜错）。
-     * 保持精简：只写字段名与最小示例，完整规范在 docs/spec/tool-ui-v3.md。
+     * 模型侧的「工具 Web UI 速查」。内置在 tool_create / web_write 的 description 里，
+     * 否则模型不知道 web/index.html 与 window.dchat 的用法。
+     * 保持精简：只写字段名与最小示例，完整规范在 docs/spec/tool-web-ui.md。
      */
-    private val UI_V3_GUIDE = """
-【工具 UI v3（多页原生界面）速查】
-目录：tools/user.<name>/ui/manifest.json + ui/pages/<page>.json + ui/assets/。
-创建多页工具：local.tool_create 传 ui_mode="pages"、ui_entry="home"；再用 local.ui_write（参数 tool_id/page/json）逐个写页面。
-manifest.json：{"version":3,"entry":"home","title":"标题","tab":[{"page":"home","text":"首页"},{"page":"settings","text":"设置"}]}（tab 可选，3-5 项才显示底部栏）。
-页面 JSON：{"version":3,"title":"页标题","theme":{"colorPrimary":"#4D6BFE","radius":14},"background":{...},"body":{...}}。
-  background：{"type":"color","value":"#101A33"} 或 {"type":"gradient","stops":[["#101A33",0],["#4B5FA8",1]],"angle":180} 或 {"type":"image","src":"assets/bg.jpg","fit":"cover","blur":8,"scrim":0.45}。
-  body 节点：{"type":"column","padding":16,"gap":12,"children":[...]}；布局 column/row/stack/scroll/grid/spacer。
-  组件：text{text,size,color,weight} / button{text,action,params,style:filled|outline|ghost} / image{src,height,fit,radius} / icon{name} / divider / progress{value} / badge{text,color} / card{...children} / input{key,placeholder,text,action} / toggle{key,value,action} / slider{key,min,max,step,value,action}。
-  绑定：字符串里 {{state.city}} 取状态值；actions 用 "action":"refresh" + 可选 "params":{...}。
-entry.py 事件（不要再写 v2 的 load/action，v3 页面用下面两个）：
-  def page_load(page, args, state) -> dict：返回 {"state": {...}} 初始化页面状态。
-  def page_action(page, action, params, state) -> dict：返回 {"state":{...}} 合并状态、{"navigate":"settings"} 跳页、{"back":True} 返回、{"toast":"已保存"}。
-示例：page_load("home", {}, {}) 返回 {"state":{"city":"广州","temp":16}}，页面 text 写 "{{state.city}} {{state.temp}}°"。
-【P3 canvas/tick/手势速查】
-canvas 节点：{"type":"canvas","id":"sky","height":240,"width":"fill","tick":true,"fps":30,"gestures":["tap","pan"],"ops":[...]}（tick 默认 false，fps 10..30，id 用于回调定位）。
-ops 类型：rect/circle/ellipse/line/polyline/path/arc/text/image/save/restore/translate/scale/rotate/alpha/clipRect。坐标 dp；fill/stroke 可为 "#RRGGBB" 或渐变 {"type":"linear","from":[0,0],"to":[240,0],"stops":[["#4D6BFE",0],["#E8835A",1]]} / {"type":"radial","center":[120,120],"radius":120,"stops":[...]}。单 canvas ops ≤800。
-Python 回调（可选）：canvas_frame(page, view_id, t_ms, dt_ms, width, height, state) -> {"ops":[...],"fps":30,"stop":false}；canvas_gesture(page, view_id, gesture, data, state) -> 同 page_action（data 含 x/y/dx/dy/scale/finger）。
-背景动画：{"type":"gradient","stops":[...],"animation":"flow","duration":8000}；预设 flow/breathe/kenburns/parallax；breathe 配 "color2":"#2C4C9E"；parallax 用 "strength":0.2..0.8。
-最小粒子示例：def canvas_frame(page, view_id, t_ms, dt_ms, w, h, state):\n  import math; ops=[{"op":"rect","x":0,"y":0,"w":w,"h":h,"fill":"#0B1020"}]\n  for i in range(40): ops.append({"op":"circle","cx":(i*97+t_ms*0.03)%w,"cy":(math.sin(i+t_ms*0.001)*0.5+0.5)*h,"r":1.6,"fill":"#FFFFFF"})\n  return {"ops":ops}
-超时提醒：canvas/建页面类工具建议 timeout_sec ≥ 60 或 0。
+    private val WEB_UI_GUIDE = """
+【工具 Web 界面速查】
+工具包：tools/user.<name>/web/index.html（入口）+ web/assets/（本地图片/CSS/JS）；tool.json 的 uiMode="web"。
+写法：HTML/CSS/JS 全部本地，可直接内联；禁止外链 CDN、远程字体/脚本和 fetch 外网（会被阻断）。
+window.dchat：dchat.call("device"/"toast"/"notify"/"battery"/... , jsonArgs) 同步返回 JSON 字符串；dchat.run("函数名","{...}") 调用本工具 entry.py 顶层函数，返回 {"ok":true,"result":"..."}；dchat.saveState(json)/loadState()/close()。
+资源：图片放 web/assets/，用相对路径 assets/xxx.png；页面用 viewport-fit=cover + env(safe-area-inset-*)。
+示例：<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>body{font-family:sans-serif;padding:20px;background:#f5f6f8}</style><h2>天气</h2><button onclick="const r=dchat.run('get_weather','{\"city\":\"广州\"}');document.querySelector('#t').textContent=JSON.parse(r).result">刷新</button>
 """.trimIndent()
 
     // ---- 旧 prefs 字段（一次性迁移 + 镜像回写用）----
@@ -643,7 +629,9 @@ Python 回调（可选）：canvas_frame(page, view_id, t_ms, dt_ms, width, heig
         // needs 含 NET，但是否真的能联网由 PyRuntime 按会话档位再判一次。
         localTool(
             ID_PYTHON, "python",
-            "在沙箱中执行 Python 代码并返回输出。适合计算、字符串处理、调用 HTTP API 等。",
+            "在沙箱中执行 Python 代码并返回输出。适合计算、字符串处理、调用 HTTP API 等。" +
+                "\nimport droid 可用：toast/vibrate/clipboard_get/clipboard_set/notify/share_text/open_url/battery/network/sensors/device/locate/pick_photo/take_photo；locate/pick_photo/take_photo 需要完全权限，权限不足抛 DroidError（DROID_DENIED/DROID_UNSUPPORTED/DROID_TIMEOUT/DROID_CANCELLED/DROID_ERROR）。" +
+                "\n示例：import droid; droid.notify(\"天气\", str(droid.battery()[\"level\"]))；droid.toast(droid.device()[\"model\"])",
             needs = setOf("NET"),
             minMode = ToolMode.WORKSPACE_WRITE,
             // 首次调用要冷启动解释器 + import 运行器，5s 会出现假超时；给到 20s
@@ -658,7 +646,8 @@ Python 回调（可选）：canvas_frame(page, view_id, t_ms, dt_ms, width, heig
                 + "需要工具带 UI 页面时，传 ui_mode=schema 并用 ui 给出 UI Schema v2，例如："
                 + "{\"version\":2,\"title\":\"天气\",\"data\":{\"city\":\"上海\",\"temp\":\"26°C\"},\"blocks\":[{\"type\":\"card\",\"children\":[{\"type\":\"keyvalue\",\"value\":{\"城市\":\"{{city}}\",\"气温\":\"{{temp}}\"}}]}]}；"
                 + "可用节点：column/row/card/group/scroll、text/markdown/image/badge/progress/keyvalue/spacer/divider、input/textarea/toggle/select/slider/date/button、list、bar/line/pie；"
-                + "字符串里的 {{key}} 会用 data[key] 替换。entry.py 可选实现 def load(args, state) 返回数据 dict、def action(name, args, data, state) 处理按钮动作。" + UI_V3_GUIDE,
+                + "字符串里的 {{key}} 会用 data[key] 替换。entry.py 可选实现 def load(args, state) 返回数据 dict、def action(name, args, data, state) 处理按钮动作。" +
+                "Web 前端可用 dchat.run(\"函数名\",\"{...}\") 调用本工具 entry.py 顶层函数取数据，返回 {\"ok\":true,\"result\":\"...\"}，适合首屏/刷新按钮。" + WEB_UI_GUIDE,
             needs = emptySet(),
             minMode = ToolMode.WORKSPACE_WRITE,
             timeoutMs = 20_000,
@@ -669,13 +658,13 @@ Python 回调（可选）：canvas_frame(page, view_id, t_ms, dt_ms, width, heig
         ),
         // ---- 4c：文件工具（fs.*） ----
         localTool(
-            ID_UI_WRITE, "ui_write",
-            "写/改用户工具的 UI v3 页面。页面 JSON 最小示例：{\"version\":3,\"body\":{\"type\":\"column\",\"children\":[{\"type\":\"text\",\"text\":\"hi\"}]}}；布局 column/row/stack/scroll/grid/spacer，组件 text/button/image/icon/divider/progress/badge/input/toggle/slider/card；绑定只支持 {{state.path}}。" + UI_V3_GUIDE,
+            ID_WEB_WRITE, "web_write",
+            "写/改用户工具的 Web 界面文件（HTML/CSS/JS/本地资源）。" + WEB_UI_GUIDE,
             needs = emptySet(),
             minMode = ToolMode.WORKSPACE_WRITE,
             timeoutMs = 10_000,
             enabled = true,
-            paramsSchema = """{"type":"object","properties":{"tool_id":{"type":"string"},"page":{"type":"string"},"json":{"type":"string"},"create_tab":{"type":"array"}},"required":["tool_id","page","json"],"additionalProperties":false}"""
+            paramsSchema = """{"type":"object","properties":{"tool_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"},"is_base64":{"type":"boolean"}},"required":["tool_id","path","content"],"additionalProperties":false}"""
         ),
         localTool(
             ID_LOCAL_WEB_SEARCH, "web_search",

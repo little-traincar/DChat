@@ -184,8 +184,6 @@ import com.dchat.app.ui.lang.money
 import com.dchat.app.ui.theme.LocalColors
 import com.dchat.app.ui.theme.brandGradient
 import com.dchat.app.ui.theme.defaultWall
-import com.dchat.app.ui.tools.UiSpecStore
-import com.dchat.app.ui.tools.UiV3Store
 import com.dchat.app.ui.voice.AsrEngine
 import com.dchat.app.ui.voice.AsrStatus
 import com.dchat.app.ui.voice.TtsEngine
@@ -3319,14 +3317,19 @@ private fun VoiceWave(progress: Float, active: Boolean) {
 private val toolUiAvailability = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
 /**
- * 工具结果卡是否显示「打开」：必须是用户工具，且已有合法 v3 `ui/manifest.json` 或 v2 `ui.json`。
- * 会读盘，调用方放 IO 线程（见 [toolUiAvailability]）。
+ * 工具结果卡是否显示「打开」：仅用户工具，且 `tool.json` 的 `uiMode == "web"` 并存在 `web/index.html`。
+ * 读原始 tool.json 而不是注册表内存值（避免旧数据/uiMode 归一化导致误判）；调用方放 IO 线程。
  */
 private fun userToolHasUi(ctx: android.content.Context, toolId: String): Boolean {
     if (!toolId.startsWith("user.")) return false
-    if (UserToolStore.find(ctx, toolId) == null) return false
-    if (UiV3Store.readManifest(ctx, toolId) != null) return true
-    return UiSpecStore.exists(ctx, toolId)
+    return runCatching {
+        val dir = UserToolStore.toolDir(ctx, toolId)
+        val index = File(File(dir, "web"), "index.html")
+        if (!index.isFile) return false
+        val meta = File(dir, "tool.json")
+        if (!meta.isFile) return false
+        JSONObject(meta.readText()).optString("uiMode").trim() == "web"
+    }.getOrDefault(false)
 }
 
 @Composable

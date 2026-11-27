@@ -23,7 +23,7 @@ object LocalToolRunner {
     const val WEB_SEARCH = "local.web_search"
     const val WEB_FETCH = "local.web_fetch"
     const val TOOL_LIST = "local.tool_list"
-    const val UI_WRITE = "local.ui_write"
+    const val WEB_WRITE = "local.web_write"
     /** 第五期：让模型自己创建 / 注册用户工具（写 entry.py + tool.json 并挂到注册表） */
     const val TOOL_CREATE = "local.tool_create"
 
@@ -33,7 +33,7 @@ object LocalToolRunner {
             toolId == WEB_SEARCH ||
             toolId == WEB_FETCH ||
             toolId == TOOL_LIST ||
-            toolId == UI_WRITE ||
+            toolId == WEB_WRITE ||
             toolId == TOOL_CREATE ||
             toolId.startsWith(FS_PREFIX) ||
             toolId.startsWith(BG_PREFIX) ||
@@ -70,7 +70,7 @@ object LocalToolRunner {
                 WEB_SEARCH, WEB_FETCH ->
                     WebTools.run(context, toolId, argsJson, conversationId ?: "preview")
                 TOOL_LIST -> toolListResult(normalized)
-                UI_WRITE -> UiWriteTool.run(context, argsJson)
+                WEB_WRITE -> WebWriteTool.run(context, argsJson)
                 IMAGEGEN -> ImageGenTool.run(
                     context = context,
                     argsJson = argsJson,

@@ -3,6 +3,7 @@ package com.dchat.app.data.tools
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.dchat.app.data.droid.DroidClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,10 +18,12 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipInputStream
 
 /**
@@ -57,6 +60,14 @@ object PyProcessRuntime {
     /** 解释器总硬限：512MB（子进程 RSS 绝对值）；超限直接 kill 子进程，下次请求自动重启解释器 */
     private const val CHILD_HARD_MEMORY_KB = 512L * 1024
     private const val MEMORY_POLL_MS = 250L
+
+    // ---- droid 能力桥（规范 docs/spec/droid-api.md）----
+    /** 普通能力（toast/notify/clipboard/battery…）宿主阻塞超时 */
+    private const val DROID_TIMEOUT_MS = 10_000L
+    /** 需要等用户操作的能力（定位/相册/相机）超时，与规范第 1 节一致 */
+    private const val DROID_LONG_TIMEOUT_MS = 120_000L
+    internal val DROID_LONG_METHODS = setOf("locate", "pick_photo", "take_photo")
+    private const val DROID_POLL_MS = 50L
 
     private val requestIds = AtomicLong(1)
     private val semaphore = Semaphore(POOL_SIZE)
@@ -131,6 +142,9 @@ object PyProcessRuntime {
 
     /** 子进程内存超限：已 close（kill），下一次请求会重新启动解释器 */
     private class ChildMemoryLimit(message: String) : Exception(message)
+
+    /** droid 调用宿主超时：已回 DROID_TIMEOUT 并 kill 子进程，避免子进程永远等回包 */
+    private class ChildDroidTimeout(message: String) : Exception(message)
 
     suspend fun runPythonCode(
         context: Context,
@@ -327,10 +341,15 @@ object PyProcessRuntime {
                 throw StartException("child worker start failed", e)
             }
             val job = currentCoroutineContext()[Job]
-            val resp = worker.request(req, timeout) {
-                // 用户点停止（协程取消）时尽快打断：由 request 循环每 250ms 检查一次
-                job?.isActive == false
-            }
+            val resp = worker.request(
+                req, timeout,
+                isCancelled = { job?.isActive == false },
+                // 串行：子进程发一个 droid 请求后自身阻塞等回包，宿主这里天然一次只处理一个。
+                // DroidHost 由 ui-bridge-worker 实现；DroidClient 负责反射/错误兜底。
+                droidCall = { method, argsJson ->
+                    DroidClient.call(method, argsJson, toolId, conversationId, conversationMode)
+                }
+            )
             synchronized(lock) {
                 activePool.remove(worker)
                 worker.lastUsedAt = SystemClock.elapsedRealtime()
@@ -349,6 +368,10 @@ object PyProcessRuntime {
         } catch (e: CancellationException) {
             // 用户停止：向上抛取消信号（worker 已在 request 里 close/kill）
             throw e
+        } catch (e: ChildDroidTimeout) {
+            // droid 宿主超时：已回 DROID_TIMEOUT 并 kill 子进程
+            Log.w(TAG, "droid call timeout, child killed", e)
+            return PyResult(false, errorCode = "DROID_TIMEOUT", errorMessage = e.message)
         } catch (e: ChildMemoryLimit) {
             Log.w(TAG, "child memory limit exceeded, killed", e)
             return PyResult(false, errorCode = "MEMORY_LIMIT", errorMessage = e.message)
@@ -611,7 +634,14 @@ object PyProcessRuntime {
 
         val isAlive: Boolean get() = alive && process.isAlive
 
-        fun request(req: JSONObject, timeoutMs: Long, isCancelled: () -> Boolean = { false }): JSONObject {
+        fun request(
+            req: JSONObject,
+            timeoutMs: Long,
+            isCancelled: () -> Boolean = { false },
+            droidCall: (String, String) -> String = { _, _ ->
+                "{\"ok\":false,\"code\":\"DROID_UNSUPPORTED\",\"error\":\"未配置 droid 能力桥\"}"
+            }
+        ): JSONObject {
             if (!isAlive) throw IOException("child not alive")
             stdin.write(req.toString())
             stdin.newLine()
@@ -658,6 +688,12 @@ object PyProcessRuntime {
                     break
                 }
                 val o = runCatching { JSONObject(line) }.getOrDefault(JSONObject())
+                // 执行期间的能力请求：kind=droid → 宿主执行后把 droid_reply 写回 stdin，
+                // 然后继续读最终执行结果（不破坏原 execute 请求/响应协议）。
+                if (o.optString("kind") == "droid") {
+                    handleDroidCall(o, droidCall, isCancelled, deadline)
+                    continue
+                }
                 if (o.optString("id").isBlank()) {
                     if (o.optString("code") == "CHILD_BOOT_FAILED") {
                         throw StartException(o.optString("error", "child boot failed"))
@@ -668,6 +704,124 @@ object PyProcessRuntime {
             }
             close()
             throw ChildTimeout("child timeout after ${timeoutMs}ms; killed")
+        }
+
+        /**
+         * 处理一条子进程 droid 请求：串行执行（子进程发请求后自身阻塞等回包），
+         * 期间持续检测子进程死亡 / 用户取消 / 内存超限 / 宿主超时。
+         * - 超时：回 DROID_TIMEOUT 后 kill 子进程（避免子进程永远等回包）；
+         * - 取消：kill 子进程并抛 CancellationException（向上传播，UI 尽快结束）；
+         * - 内存：kill 子进程并抛 ChildMemoryLimit（MEMORY_LIMIT）。
+         */
+        private fun handleDroidCall(
+            o: JSONObject,
+            droidCall: (String, String) -> String,
+            isCancelled: () -> Boolean,
+            overallDeadlineNanos: Long
+        ) {
+            val id = o.opt("id")
+            val method = o.optString("method").trim()
+            if (method.isBlank()) {
+                writeDroidError(id, "DROID_ERROR", "droid 请求缺少 method")
+                return
+            }
+            val argsJson = (o.optJSONObject("args") ?: JSONObject()).toString()
+            val timeoutMs = if (method in DROID_LONG_METHODS) DROID_LONG_TIMEOUT_MS else DROID_TIMEOUT_MS
+            // 用独立线程 + latch 调宿主：DroidHost 可能阻塞最多 120s（相册/相机/定位），
+            // 期间本线程继续做 死亡/取消/内存/超时 检测。
+            val resultRef = AtomicReference<String?>()
+            val errorRef = AtomicReference<Throwable?>()
+            val latch = CountDownLatch(1)
+            val thread = Thread({
+                try {
+                    resultRef.set(droidCall(method, argsJson))
+                } catch (t: Throwable) {
+                    errorRef.set(t)
+                } finally {
+                    latch.countDown()
+                }
+            }, "pychild-droid").apply { isDaemon = true }
+            thread.start()
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            val baselineKb = rssKb
+            try {
+                while (!latch.await(DROID_POLL_MS, TimeUnit.MILLISECONDS)) {
+                    if (!isAlive) throw IOException("child died during droid call")
+                    if (isCancelled()) {
+                        close()
+                        throw CancellationException("droid call cancelled by user")
+                    }
+                    val rss = rssKb
+                    if (rss > 0) {
+                        if (rss > CHILD_HARD_MEMORY_KB) {
+                            close()
+                            throw ChildMemoryLimit("Python 解释器内存超过 512MB，已终止子进程并将在下次请求重启")
+                        }
+                        if (baselineKb > 0 && rss - baselineKb > CHILD_SOFT_MEMORY_KB) {
+                            close()
+                            throw ChildMemoryLimit("单次执行内存超过 256MB，已终止子进程并将在下次请求重启")
+                        }
+                    }
+                    if (System.nanoTime() >= deadline) {
+                        thread.interrupt()
+                        writeDroidError(id, "DROID_TIMEOUT", "droid 调用超时（${timeoutMs / 1000}s），请重试")
+                        close()
+                        throw ChildDroidTimeout("droid 调用超时（${timeoutMs / 1000}s），已终止子进程")
+                    }
+                    // 整体执行超时（ToolRegistry 传的 timeoutMs）在等 droid 回包期间也不能暂停
+                    if (overallDeadlineNanos > 0 && System.nanoTime() >= overallDeadlineNanos) {
+                        thread.interrupt()
+                        writeDroidError(id, "DROID_TIMEOUT", "Python 执行整体超时")
+                        close()
+                        throw ChildTimeout("child timeout while waiting droid reply; killed")
+                    }
+                }
+                val err = errorRef.get()
+                if (err != null) {
+                    writeDroidError(id, "DROID_ERROR", err.message ?: err.javaClass.simpleName)
+                    return
+                }
+                writeDroidResult(id, resultRef.get().orEmpty())
+            } finally {
+                thread.interrupt()
+            }
+        }
+
+        /** 成功/失败回包：把宿主 JSON 的 result 原样转发（对象/数组/null 都保持结构） */
+        private fun writeDroidResult(id: Any?, raw: String) {
+            val out = runCatching { JSONObject(raw) }.getOrNull()
+            if (out != null && out.optBoolean("ok", false)) {
+                val reply = JSONObject()
+                    .put("kind", "droid_reply")
+                    .put("id", id ?: JSONObject.NULL)
+                    .put("ok", true)
+                    .put("result", out.opt("result") ?: JSONObject.NULL)
+                writeProtocolLine(reply.toString())
+            } else {
+                writeDroidError(
+                    id,
+                    out?.optString("code").orEmpty().ifBlank { "DROID_ERROR" },
+                    out?.optString("error").orEmpty().ifBlank { "droid 调用失败" }
+                )
+            }
+        }
+
+        private fun writeDroidError(id: Any?, code: String, error: String) {
+            val reply = JSONObject()
+                .put("kind", "droid_reply")
+                .put("id", id ?: JSONObject.NULL)
+                .put("ok", false)
+                .put("code", code)
+                .put("error", error)
+            writeProtocolLine(reply.toString())
+        }
+
+        private fun writeProtocolLine(text: String) {
+            synchronized(stdin) {
+                stdin.write(text)
+                stdin.newLine()
+                stdin.flush()
+            }
         }
 
         fun close() {

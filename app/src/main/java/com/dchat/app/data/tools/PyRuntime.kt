@@ -201,7 +201,9 @@ object PyRuntime {
                     sandbox.absolutePath,
                     sitePackages.absolutePath,
                     statePath.absolutePath,
-                    conversationMode
+                    conversationMode,
+                    toolId,
+                    conversationId
                 ).toString()
             })
             Log.i("PyRuntime", "runPythonCode timeout=" + if (timeoutMs <= 0) "unlimited" else "${timeoutMs}ms")
@@ -322,7 +324,9 @@ object PyRuntime {
                     sandbox.absolutePath,
                     sitePackages.absolutePath,
                     statePath.absolutePath,
-                    conversationMode
+                    conversationMode,
+                    toolId,
+                    conversationId
                 ).toString()
                 raw
             })

@@ -36,7 +36,9 @@ data class UserToolDef(
     /** 4b：`data` 自动渲染 / `schema` UI 树 / `pages` v3 多页 */
     val uiMode: String = "data",
     /** 用户工具执行超时毫秒；0 = 不限时，旧数据缺省 30s */
-    val timeoutMs: Int = 30_000
+    val timeoutMs: Int = 30_000,
+    /** droid 能力声明，仅展示/提示；旧数据缺省空 */
+    val needs: List<String> = emptyList()
 )
 
 object UserToolStore {
@@ -106,6 +108,9 @@ object UserToolStore {
         val reqs = o.optJSONArray("requirements")?.let { arr ->
             (0 until arr.length()).mapNotNull { i -> arr.optString(i).takeIf { it.isNotBlank() } }
         } ?: emptyList()
+        val needs = o.optJSONArray("needs")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i -> arr.optString(i).takeIf { it.isNotBlank() } }
+        } ?: emptyList()
         val spec = ToolRegistry.byId(id)
         return UserToolDef(
             id = id,
@@ -119,7 +124,8 @@ object UserToolStore {
             enabled = spec?.enabled ?: o.optBoolean("enabled", false),
             code = codeFile.readText(),
             uiMode = normalizeUiMode(o.optString("uiMode")),
-            timeoutMs = o.optInt("timeoutMs", 30_000).coerceAtLeast(0)
+            timeoutMs = o.optInt("timeoutMs", 30_000).coerceAtLeast(0),
+            needs = needs
         )
     }
 
@@ -177,7 +183,7 @@ object UserToolStore {
                     description = saved.description,
                     source = ToolSource.USER,
                     paramsSchema = saved.paramsSchema,
-                    needs = emptySet(),
+                    needs = saved.needs.toSet(),
                     option = null,
                     costNote = "本机 · 免费",
                     minMode = saved.minMode,
@@ -229,6 +235,7 @@ object UserToolStore {
                     description = def.description,
                     source = ToolSource.USER,
                     paramsSchema = def.paramsSchema,
+                    needs = def.needs.toSet(),
                     option = null,
                     costNote = "本机 · 免费",
                     minMode = def.minMode,
@@ -264,6 +271,7 @@ object UserToolStore {
         .put("enabled", def.enabled)
         .put("uiMode", normalizeUiMode(def.uiMode))
         .put("timeoutMs", def.timeoutMs.coerceAtLeast(0))
+        .put("needs", JSONArray(def.needs))
 
     /** 4b：会话级工具状态；不存在时返回空对象 */
     fun readState(context: Context, toolId: String, conversationId: String): JSONObject =
@@ -285,7 +293,7 @@ object UserToolStore {
     }.getOrDefault(false)
 
     private fun normalizeUiMode(raw: String): String =
-        if (raw == "schema" || raw == "pages") raw else "data"
+        if (raw == "web") "web" else "data"
 
     private fun writeAtomic(target: File, text: String) {
         target.parentFile?.mkdirs()

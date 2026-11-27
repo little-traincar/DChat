@@ -92,7 +92,6 @@ import com.dchat.app.ui.lang.AppRegion
 import com.dchat.app.ui.lang.LocalStrings
 import com.dchat.app.ui.lang.Str
 import com.dchat.app.ui.lang.format
-import com.dchat.app.ui.tools.UserToolUi
 import com.dchat.app.ui.theme.LocalColors
 import com.dchat.app.ui.theme.brandGradient
 import com.dchat.app.ui.voice.TtsEngine
@@ -1699,15 +1698,7 @@ private fun UserToolEditor(
     var entryFunction by remember(toolId) { mutableStateOf(initial?.entryFunction ?: "run") }
     var mode by remember(toolId) { mutableStateOf(initial?.minMode ?: ToolMode.WORKSPACE_WRITE) }
     var uiMode by remember(toolId) {
-        mutableStateOf(
-            if (initial?.id?.let { com.dchat.app.ui.tools.UiV3Store.readManifest(ctx, it) } != null) "pages"
-            else initial?.uiMode ?: "data"
-        )
-    }
-    var uiEntry by remember(toolId) {
-        mutableStateOf(
-            initial?.id?.let { com.dchat.app.ui.tools.UiV3Store.readManifest(ctx, it)?.entry } ?: ""
-        )
+        mutableStateOf(if (initial?.uiMode == "web") "web" else "data")
     }
     var timeoutSecText by remember(toolId) {
         mutableStateOf(
@@ -1741,31 +1732,7 @@ private fun UserToolEditor(
             params.any { it.name.isBlank() || !it.name.matches(Regex("^[A-Za-z_][A-Za-z0-9_]*$")) } ||
                 params.map { it.name }.distinct().size != params.size ||
                 params.any { it.type !in PARAM_TYPES } -> error = L.tools.editorParamsInvalid
-            uiMode == "pages" && !com.dchat.app.ui.tools.UiV3Model.isPageName(uiEntry) ->
-                error = L.tools.uiModeEntryInvalid
-            uiMode == "pages" && (initial == null ||
-                com.dchat.app.ui.tools.UiV3Store.readPage(ctx, initial.id, uiEntry) == null) ->
-                error = L.tools.uiModePagesNeedCreate
             else -> {
-                // v3 只更新 manifest.entry，绝不覆盖已存在的 pages/*
-                if (uiMode == "pages") {
-                    val iid = initial!!.id
-                    val old = com.dchat.app.ui.tools.UiV3Store.readManifest(ctx, iid)
-                    val tab = JSONArray()
-                    old?.tab?.forEach {
-                        tab.put(JSONObject().put("page", it.page).put("text", it.text).put("icon", it.icon))
-                    }
-                    val manifest = JSONObject()
-                        .put("version", 3)
-                        .put("entry", uiEntry)
-                        .put("title", old?.title ?: name)
-                        .put("tab", tab)
-                    val mv = com.dchat.app.ui.tools.UiV3Store.writeManifest(ctx, iid, manifest)
-                    if (!mv.ok) {
-                        error = L.tools.uiModePagesNeedCreate
-                        return
-                    }
-                }
                 val saved = UserToolStore.save(
                     ctx,
                     UserToolDef(
@@ -1945,8 +1912,7 @@ private fun UserToolEditor(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     listOf(
                         "data" to L.tools.uiModeData,
-                        "schema" to L.tools.uiModeSchema,
-                        "pages" to L.tools.uiModePages
+                        "web" to L.tools.uiModeWeb
                     ).forEach { (m, label) ->
                         Box(
                             Modifier
@@ -1966,27 +1932,10 @@ private fun UserToolEditor(
                     }
                 }
                 Spacer(Modifier.height(5.dp))
-                Text(L.tools.uiModeHint, fontSize = 10.5.sp, color = c.text3, lineHeight = 15.sp)
-                if (uiMode == "pages") {
-                    Spacer(Modifier.height(8.dp))
-                    EditorSmallField(
-                        L.tools.uiModeEntry,
-                        uiEntry,
-                        { v -> uiEntry = v },
-                        Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    val v3Ready = initial?.id?.let {
-                        com.dchat.app.ui.tools.UiV3Store.readManifest(ctx, it) != null ||
-                            com.dchat.app.ui.tools.UiV3Store.listPages(ctx, it).isNotEmpty()
-                    } == true
-                    Text(
-                        if (v3Ready) L.tools.uiModePagesHint else L.tools.uiModePagesNeedCreate,
-                        fontSize = 10.5.sp,
-                        color = if (v3Ready) c.text3 else c.danger,
-                        lineHeight = 15.sp
-                    )
-                }
+                Text(
+                    if (uiMode == "web") L.tools.uiModeWebHint else L.tools.uiModeHint,
+                    fontSize = 10.5.sp, color = c.text3, lineHeight = 15.sp
+                )
                 Spacer(Modifier.height(8.dp))
                 EditorSmallField(
                     L.tools.editorTimeout,
@@ -2140,11 +2089,8 @@ private fun UserToolEditor(
                     if (runOutput == null) {
                         Text(L.tools.uiPreviewEmpty, fontSize = 11.sp, color = c.text3)
                     } else {
-                        UserToolUi(
-                            raw = runOutput ?: "",
-                            uiMode = uiMode,
-                            onEvent = { ev, v -> rerunPreviewEvent(ev, v) }
-                        )
+                        // v3/v2 渲染已删除：网页界面请在工具页里打开预览
+                        Text(L.tools.uiModeWebHint, fontSize = 11.sp, color = c.text3)
                     }
                 }
                 Spacer(Modifier.height(14.dp))

@@ -15,6 +15,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -71,13 +72,31 @@ class MainActivity : ComponentActivity() {
                 stack.add(Screen.Files)
             }
 
+            // droid 原生能力桥（docs/spec/droid-api.md）：注入 Activity 弱引用 + 内置浏览器 opener；
+            // 相册/相机/权限/Toast/通知都由 DroidHost 主线程执行，工具在后台线程阻塞等待结果。
+            DisposableEffect(Unit) {
+                com.dchat.app.data.droid.DroidHost.attach(
+                    this@MainActivity,
+                    openUrl = { u ->
+                        browserUrl = u
+                        stack.add(Screen.Browser)
+                    }
+                )
+                onDispose {
+                    com.dchat.app.data.droid.DroidHost.detach(this@MainActivity)
+                }
+            }
+
             val settings = app.settings
             // 返回键提示在 DchatTheme 之外注册（要先于浮层），所以这里自己取一份当前文案
             val strings = Lang.of(settings.language, settings.region)
             val dark = settings.darkTheme
             val view = LocalView.current
             SideEffect {
-                WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !dark
+                // 工具页是整屏 WebView，状态栏叠在页面背景上：默认用白色图标（页面背景通常较深）；
+                // 其它界面按主题（浅色主题 → 深色图标）
+                val lightIcons = if (current == Screen.ToolUi) false else !dark
+                WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = lightIcons
             }
 
             // 先注册页面级返回，后注册的浮层（抽屉/面板/弹窗）会优先生效
@@ -126,7 +145,7 @@ class MainActivity : ComponentActivity() {
                             onOpenBgTasks = { stack.add(Screen.BgTasks) },
                             onOpenSchedule = { stack.add(Screen.Schedule) },
                             onOpenFiles = openFiles,
-                            // 工具 UI v3：工具结果卡「打开」→ 全屏工具页（版本分发在 ToolUiScreen 内）
+                            // 工具 Web 页：工具结果卡「打开」→ 全屏 WebView 工具页（模式分流在 ToolUiScreen 内）
                             onOpenToolUi = { toolId ->
                                 toolUiTarget = toolId
                                 stack.add(Screen.ToolUi)
@@ -167,8 +186,9 @@ class MainActivity : ComponentActivity() {
 
                         Screen.ToolUi -> ToolUiScreen(
                             toolId = toolUiTarget.orEmpty(),
-                            // v3 的 workspace: 图片按当前会话工作区解析
+                            // Web 工具页：state 按会话隔离；权限档位取当前会话（缺失时 ToolUiScreen 内部按 read 兜底）
                             conversationId = app.currentId,
+                            permission = app.current()?.permission.orEmpty(),
                             onBack = { if (stack.isNotEmpty()) stack.removeAt(stack.lastIndex) }
                         )
 
